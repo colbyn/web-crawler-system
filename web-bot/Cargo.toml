@@ -12,6 +12,8 @@ serde_json = "1"
 url = "2"
 anyhow = "1"
 walkdir = "2.5.0"
+colored = "3.0.0"
+colored_json = "5.0.0"
 
 web-crawler-engine-v3 = { path = "../web-crawler-engine-v3" }
 web-browser-driver = { path = "../web-browser-driver" }

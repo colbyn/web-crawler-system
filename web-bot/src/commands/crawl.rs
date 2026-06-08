@@ -5,6 +5,8 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 use serde_json::Value;
 use url::Url;
+#[allow(unused)]
+use colored::Colorize;
 use web_crawler_engine_v3::{
     cache::FsCrawlCacheStore,
     config::{CrawlEngineConfig, CrawlLimits},

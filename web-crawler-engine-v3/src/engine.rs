@@ -12,6 +12,7 @@
 
 use std::marker::PhantomData;
 
+use colored_json::Paint;
 use serde::{de::DeserializeOwned, Serialize};
 use web_browser_driver::{
     AnchorExtractor, BrowserDriver, OpenPageOptions, PageInfoExtractor,
@@ -253,6 +254,12 @@ where
         _assignment: BrowserProfileAssignment,
         session: &mut web_browser_driver::BrowserSession,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
+        {
+            eprintln!("{}", format!(
+                "🌐 {}",
+                request.requested_url.as_str().magenta(),
+            ).cyan());
+        }
         let mut open_options = OpenPageOptions::new(request.requested_url.clone());
         open_options.timeout = Some(self.config.page_open_timeout);
 
