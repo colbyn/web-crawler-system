@@ -10,9 +10,15 @@ pub enum CacheCommands {
     /// Show metadata for a cached URL
     Lookup {
         url: String,
+        #[arg(long)]
+        json: bool,
+
+        /// Print the full artifact (including HTML body and anchors)
+        #[arg(long)]
+        full: bool,
     },
 
-    /// Print or save the HTML snapshot of a cached page
+    /// Print or save the HTML snapshot
     Snapshot {
         url: String,
         /// Write to file instead of stdout
@@ -20,31 +26,33 @@ pub enum CacheCommands {
         output: Option<PathBuf>,
     },
 
-    /// Remove a specific URL from the cache
+    /// Remove a URL from the cache
     Remove {
         url: String,
-        /// Skip confirmation prompt
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Delete all cached data (use with caution)
+    /// Clear the entire cache
     Clear {
-        /// Skip confirmation prompt
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Show basic cache statistics
-    Stats,
+    /// Show cache statistics
+    Stats {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(action: CacheCommands, cache_root: &PathBuf) -> anyhow::Result<()> {
     let store = FsCrawlCacheStore::new(cache_root);
 
     match action {
-        CacheCommands::Lookup { url } => {
-            lookup_metadata(&store, &url).await?;
+        CacheCommands::Lookup { url, json, full } => {
+            lookup_metadata(&store, &url, json, full).await?;
         }
 
         CacheCommands::Snapshot { url, output } => {
@@ -59,8 +67,8 @@ pub async fn run(action: CacheCommands, cache_root: &PathBuf) -> anyhow::Result<
             clear_cache(cache_root, force).await?;
         }
 
-        CacheCommands::Stats => {
-            show_stats(cache_root).await?;
+        CacheCommands::Stats { json } => {
+            show_stats(cache_root, json).await?;
         }
     }
 
@@ -72,9 +80,9 @@ pub async fn run(action: CacheCommands, cache_root: &PathBuf) -> anyhow::Result<
 async fn lookup_metadata(
     store: &FsCrawlCacheStore,
     url: &str,
+    json: bool,
+    full: bool,           // NEW: whether to print full artifact
 ) -> anyhow::Result<()> {
-    println!("Looking up: {}", url);
-
     let profile_key = web_browser_driver::BrowserProfileKey::new("default");
     let cache_key = CacheKey::for_request(
         url::Url::parse(url)?,
@@ -84,22 +92,45 @@ async fn lookup_metadata(
 
     match store.load(&cache_key).await {
         Ok(Some(artifact)) => {
-            println!("\n✅ Cache Hit");
-            println!("  Stored at (unix ms): {}", artifact.stored_at_unix_ms);
-            println!("  Requested URL:       {}", artifact.resolution.requested_url);
-            println!("  Final URL:           {}", artifact.resolution.final_url);
-            println!("  Was redirected:      {}", artifact.resolution.was_redirected());
-            println!("  Status code:         {:?}", artifact.status_code);
-            println!("  Snapshot size:       {} bytes", artifact.snapshot.body.len());
-            println!("  Compression:         {:?}", artifact.snapshot.compression);
+            if json {
+                if full {
+                    // Full artifact (can be large)
+                    if let Ok(json_str) = serde_json::to_string_pretty(&artifact) {
+                        println!("{}", json_str);
+                    }
+                } else {
+                    // Light metadata only (recommended default)
+                    let mut artifact = serde_json::to_value(&artifact).unwrap();
+                    if let Some(data) = artifact.pointer_mut("/snapshot/body") {
+                        *data = serde_json::Value::Null;
+                    }
+                    // println!("{}", serde_json::to_string_pretty(&artifact)?);
+                    println!("{}", colored_json::to_colored_json_auto(&artifact).unwrap());
+                }
+            } else {
+                // Human readable output (to stderr)
+                eprintln!("✅ Cache Hit: {}", url);
+                eprintln!("  Final URL:      {}", artifact.resolution.final_url);
+                eprintln!("  Snapshot size:  {} bytes", artifact.snapshot.body.len());
+                eprintln!("  Anchors:        {}", artifact.extracted.anchors.len());
 
-            if let Some(page_info) = &artifact.extracted.page_info {
-                println!("  Title:               {:?}", page_info.title);
+                if let Some(page_info) = &artifact.extracted.page_info {
+                    if let Some(title) = &page_info.title {
+                        eprintln!("  Title:          {}", title);
+                    }
+                }
             }
-            println!("  Anchors found:       {}", artifact.extracted.anchors.len());
         }
-        Ok(None) => println!("\n❌ Not found in cache"),
-        Err(e) => eprintln!("Error: {}", e),
+        Ok(None) => {
+            if json {
+                println!("null");
+            } else {
+                eprintln!("❌ Not found in cache: {}", url);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error loading from cache: {}", e);
+        }
     }
 
     Ok(())
@@ -131,8 +162,9 @@ async fn get_snapshot(
 
     if let Some(path) = output {
         std::fs::write(&path, &html)?;
-        println!("Snapshot written to {}", path.display());
+        eprintln!("Snapshot written to {}", path.display());
     } else {
+        // Actual data → stdout
         println!("{}", html);
     }
 
@@ -145,13 +177,13 @@ async fn remove_url(
     force: bool,
 ) -> anyhow::Result<()> {
     if !force {
-        print!("Remove {} from cache? [y/N]: ", url);
+        eprint!("Remove {} from cache? [y/N]: ", url);
         use std::io::{self, Write};
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
+            eprintln!("Aborted.");
             return Ok(());
         }
     }
@@ -163,14 +195,13 @@ async fn remove_url(
         None,
     );
 
-    // We don't have a direct delete API yet, so we delete the file manually
     let path = store.path_for_key(&cache_key)?;
 
     if path.exists() {
         std::fs::remove_file(&path)?;
-        println!("✅ Removed from cache: {}", url);
+        eprintln!("✅ Removed from cache: {}", url);
     } else {
-        println!("Not found in cache.");
+        eprintln!("Not found in cache.");
     }
 
     Ok(())
@@ -178,14 +209,14 @@ async fn remove_url(
 
 async fn clear_cache(cache_root: &PathBuf, force: bool) -> anyhow::Result<()> {
     if !force {
-        println!("This will delete ALL cached data in: {}", cache_root.display());
-        print!("Are you sure? [y/N]: ");
+        eprintln!("This will delete ALL data in: {}", cache_root.display());
+        eprint!("Are you sure? [y/N]: ");
         use std::io::{self, Write};
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
+            eprintln!("Aborted.");
             return Ok(());
         }
     }
@@ -195,16 +226,19 @@ async fn clear_cache(cache_root: &PathBuf, force: bool) -> anyhow::Result<()> {
         std::fs::remove_dir_all(&pages_dir)?;
     }
 
-    println!("✅ Cache cleared.");
+    eprintln!("✅ Cache cleared.");
     Ok(())
 }
 
-async fn show_stats(cache_root: &PathBuf) -> anyhow::Result<()> {
-    println!("Cache root: {}", cache_root.display());
-
+async fn show_stats(cache_root: &PathBuf, json: bool) -> anyhow::Result<()> {
     let pages_dir = cache_root.join("pages");
+
     if !pages_dir.exists() {
-        println!("No cached data.");
+        if json {
+            println!(r#"{{"total_pages": 0, "total_size_bytes": 0}}"#);
+        } else {
+            eprintln!("No cached data found.");
+        }
         return Ok(());
     }
 
@@ -223,13 +257,22 @@ async fn show_stats(cache_root: &PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    println!("Total pages:  {}", total_files);
-    println!(
-        "Disk usage:   {} bytes ({:.2} MB)",
-        total_size,
-        total_size as f64 / 1_048_576.0
-    );
+    if json {
+        // Structured output → stdout
+        println!(
+            r#"{{"total_pages": {}, "total_size_bytes": {}}}"#,
+            total_files, total_size
+        );
+    } else {
+        // Human output → stderr
+        eprintln!("Cache root: {}", cache_root.display());
+        eprintln!("Total pages:  {}", total_files);
+        eprintln!(
+            "Disk usage:   {} bytes ({:.2} MB)",
+            total_size,
+            total_size as f64 / 1_048_576.0
+        );
+    }
 
     Ok(())
 }
-

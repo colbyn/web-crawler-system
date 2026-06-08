@@ -1,12 +1,14 @@
 //! Crawl command implementation.
 
+//! Crawl command implementation.
+
 use clap::Args;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+
+use anyhow::Context;
 use serde_json::Value;
 use url::Url;
-#[allow(unused)]
-use colored::Colorize;
 use web_crawler_engine_v3::{
     cache::FsCrawlCacheStore,
     config::{CrawlEngineConfig, CrawlLimits},
@@ -20,15 +22,14 @@ use web_browser_driver::BrowserDriver;
 #[derive(Args, Debug)]
 pub struct CrawlArgs {
     /// URLs to crawl. Can be repeated. Use `-i -` to explicitly read from stdin.
-    /// Each value can contain multiple space-separated URLs.
     #[arg(short = 'i', long = "input", action = clap::ArgAction::Append)]
     pub inputs: Vec<String>,
 
-    /// Input format when reading from stdin or structured data
+    /// Input format when reading structured data
     #[arg(long, default_value = "text")]
     pub format: String,
 
-    /// JSON Pointer to extract the URL (used with ndjson/json)
+    /// JSON Pointer to extract the URL from JSON input
     #[arg(long)]
     pub url_pointer: Option<String>,
 
@@ -36,17 +37,18 @@ pub struct CrawlArgs {
     #[arg(long)]
     pub attach_provenance: bool,
 
-    /// Maximum pages to crawl in this run
+    /// Output crawl results as NDJSON to stdout
+    #[arg(long)]
+    pub json: bool,
+
     #[arg(long, default_value_t = 50)]
     pub max_pages: usize,
 
-    /// Maximum hop depth from seeds
     #[arg(long, default_value_t = 1)]
     pub max_depth: u32,
 }
 
-/// Collect raw input lines from `-i` flags and/or stdin.
-/// `-i -` forces reading from stdin.
+/// Collect input lines from `-i` flags and/or stdin
 fn collect_input_lines(args: &CrawlArgs) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut read_stdin = false;
@@ -63,14 +65,12 @@ fn collect_input_lines(args: &CrawlArgs) -> anyhow::Result<Vec<String>> {
         }
     }
 
-    // Read stdin if `-i -` was used or if no -i flags were provided
     if read_stdin || args.inputs.is_empty() {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
-            let line = line?;
-            let trimmed = line.trim();
+            let trimmed = line?.trim().to_string();
             if !trimmed.is_empty() {
-                lines.push(trimmed.to_string());
+                lines.push(trimmed);
             }
         }
     }
@@ -86,11 +86,16 @@ pub async fn run(
     let raw_lines = collect_input_lines(&args)?;
 
     if raw_lines.is_empty() {
-        println!("No URLs provided.");
+        if args.json {
+            // Emit empty array for machine consumers
+            println!("[]");
+        } else {
+            eprintln!("No URLs provided.");
+        }
         return Ok(());
     }
 
-    // Parse raw lines into (URL, optional provenance)
+    // === Parse input ===
     let mut parsed = Vec::new();
 
     for line in raw_lines {
@@ -123,36 +128,31 @@ pub async fn run(
                     match json.get("url").and_then(|v| v.as_str()) {
                         Some(u) => u.to_string(),
                         None => {
-                            eprintln!("No `url` field found in JSON");
+                            eprintln!("No `url` field found");
                             continue;
                         }
                     }
                 };
 
                 if let Ok(url) = Url::parse(&url_str) {
-                    let provenance = if args.attach_provenance {
-                        Some(json)
-                    } else {
-                        None
-                    };
+                    let provenance = if args.attach_provenance { Some(json) } else { None };
                     parsed.push((url, provenance));
                 } else {
                     eprintln!("Invalid URL extracted: {}", url_str);
                 }
             }
-            other => {
-                anyhow::bail!("Unsupported format: {}", other);
-            }
+            other => anyhow::bail!("Unsupported format: {}", other),
         }
     }
 
     if parsed.is_empty() {
-        println!("No valid URLs to crawl after parsing.");
+        eprintln!("No valid URLs to crawl after parsing.");
         return Ok(());
     }
 
-    println!("Crawling {} URLs...", parsed.len());
+    eprintln!("Crawling {} URLs...", parsed.len());
 
+    // === Engine Setup ===
     let cache_store = FsCrawlCacheStore::new(cache_root);
     let driver = BrowserDriver::new(Default::default());
 
@@ -184,24 +184,44 @@ pub async fn run(
         requests.push(CrawlRequest::seed(url, prov));
     }
 
+    // === Run Crawl ===
     let result = engine.crawl(requests).await?;
 
-    // Summary
-    let mut success = 0;
-    let mut failed = 0;
+    // === Output ===
+    if args.json {
+        // Structured output to STDOUT (NDJSON)
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
 
-    for page in &result.pages {
-        match &page.outcome {
-            web_crawler_engine_v3::output::CrawlPageOutcome::Opened { .. } => success += 1,
-            web_crawler_engine_v3::output::CrawlPageOutcome::Failed { .. } => failed += 1,
-            _ => {}
+        for page in &result.pages {
+            if let Ok(json_line) = serde_json::to_string(page) {
+                let _ = writeln!(handle, "{}", json_line);
+            }
         }
-    }
+    } else {
+        // Human-readable summary to STDERR
+        let mut success = 0;
+        let mut failed = 0;
+        let mut from_cache = 0;
 
-    println!("\n=== Crawl Complete ===");
-    println!("Total processed: {}", result.pages.len());
-    println!("  Successful:    {}", success);
-    println!("  Failed:        {}", failed);
+        for page in &result.pages {
+            match &page.outcome {
+                web_crawler_engine_v3::output::CrawlPageOutcome::Opened { .. } => {
+                    success += 1;
+                    if matches!(page.cache_decision, Some(web_crawler_engine_v3::CacheDecision::Use)) {
+                        from_cache += 1;
+                    }
+                }
+                web_crawler_engine_v3::output::CrawlPageOutcome::Failed { .. } => failed += 1,
+                _ => {}
+            }
+        }
+
+        eprintln!("\n=== Crawl Complete ===");
+        eprintln!("Total processed: {}", result.pages.len());
+        eprintln!("  Successful:    {} ({} from cache)", success, from_cache);
+        eprintln!("  Failed:        {}", failed);
+    }
 
     Ok(())
 }

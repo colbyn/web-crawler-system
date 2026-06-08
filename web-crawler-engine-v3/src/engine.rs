@@ -162,9 +162,11 @@ where
             };
             let request = item.request;
 
-            if state.has_seen_fetch_key(&request) {
+            if state.has_visited_fetch_key(&request) {
+                eprintln!("👻 already seen, skipping {}", request.requested_url);
                 continue;
             }
+
             state.mark_visited(&request);
 
             match self.policy.evaluate_visit(&request, &self.config.limits) {
@@ -191,10 +193,19 @@ where
                 None,
             );
 
-            // Fast path: try cache before acquiring a browser session
+            // Fast path: try cache before acquiring a browser session.
+            //
+            // Important: a cache hit should behave like replayed page evidence.
+            // Cached artifacts contain extracted anchors, so they must still expand
+            // the frontier; otherwise warm-cache crawls stop at the seed page.
             if let Some(cached_result) = self.try_cache(&request, &cache_key).await? {
                 self.sink.record_page(&cached_result).await?;
-                state.record_page(cached_result);
+                state.record_page(cached_result.clone());
+
+                if let CrawlPageOutcome::Opened { anchors, .. } = &cached_result.outcome {
+                    state.expand_from_anchors(&request, anchors, &self.policy);
+                }
+
                 continue;
             }
 
@@ -232,8 +243,14 @@ where
                 sessions.terminate_for_request(&request).await;
             }
 
+            // Record the result
             self.sink.record_page(&result).await?;
-            state.record_page(result);
+            state.record_page(result.clone());
+
+            // === CRITICAL: Expand frontier from discovered anchors ===
+            if let CrawlPageOutcome::Opened { anchors, .. } = &result.outcome {
+                state.expand_from_anchors(&request, anchors, &self.policy);
+            }
         }
 
         sessions.shutdown_all().await;

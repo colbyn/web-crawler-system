@@ -1786,6 +1786,7 @@ dependencies = [
  "colored",
  "colored_json",
  "hex",
+ "indexmap",
  "serde",
  "serde_json",
  "sha2",

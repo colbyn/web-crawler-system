@@ -2,20 +2,14 @@
 //!
 //! The frontier is the engine's queue of candidate URLs to visit.
 //!
-//! It must preserve provenance. A discovered URL is not just a string waiting
-//! in line. It carries seed lineage, hop depth, source URL, profile assignment,
-//! and caller-owned metadata.
+//! This implementation is intentionally deterministic FIFO for now.
+//! Priority scheduling can return later once scoring is meaningful.
 //!
-//! This module should remain focused on queue mechanics and item identity. It
-//! should not open browsers, inspect pages, evaluate cache health, or decide
-//! application-level meaning.
-//!
-//! Priority scoring is intentionally primitive at first. The engine can later
-//! add URL heuristics such as favoring about/contact/careers pages or penalizing
-//! assets, tracking params, and infinite calendar traps.
+//! Deterministic FIFO matters because cache-warm crawls should tend to replay
+//! the same crawl order as cold crawls when inputs and extracted anchors are the
+//! same.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 
 use serde::{
     Deserialize,
@@ -50,6 +44,10 @@ impl Default for FrontierScore {
 pub struct FrontierItem<P = serde_json::Value> {
     pub id: FrontierItemId,
     pub request: CrawlRequest<P>,
+
+    /// Reserved for future priority scheduling.
+    ///
+    /// Current frontier behavior is FIFO, so this field is carried but not used.
     pub score: FrontierScore,
 }
 
@@ -68,60 +66,38 @@ impl<P> FrontierItem<P> {
     }
 }
 
-impl<P> PartialEq for FrontierItem<P> {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.id == other.id
-    }
-}
-
-impl<P> Eq for FrontierItem<P> {}
-
-impl<P> PartialOrd for FrontierItem<P> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<P> Ord for FrontierItem<P> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .cmp(&other.score)
-            .then_with(|| self.id.0.cmp(&other.id.0))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct FrontierQueue<P = serde_json::Value> {
-    heap: BinaryHeap<FrontierItem<P>>,
+    queue: VecDeque<FrontierItem<P>>,
     max_items: usize,
 }
 
 impl<P> FrontierQueue<P> {
     pub fn new(max_items: usize) -> Self {
         Self {
-            heap: BinaryHeap::new(),
+            queue: VecDeque::new(),
             max_items,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.heap.len()
+        self.queue.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.queue.is_empty()
     }
 
     pub fn push(&mut self, item: FrontierItem<P>) -> bool {
-        if self.heap.len() >= self.max_items {
+        if self.queue.len() >= self.max_items {
             return false;
         }
 
-        self.heap.push(item);
+        self.queue.push_back(item);
         true
     }
 
     pub fn pop(&mut self) -> Option<FrontierItem<P>> {
-        self.heap.pop()
+        self.queue.pop_front()
     }
 }
