@@ -19,4 +19,6 @@ colored = "3.0.0"
 colored_json = "5.0.0"
 indexmap = { version = "2.10.0", features = ['serde']}
 
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+
 web-browser-driver = { path = "../web-browser-driver" }

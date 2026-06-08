@@ -55,7 +55,7 @@
 //!
 //! See the module-level docs in the original design for the full philosophy.
 
-pub mod cache;
+pub mod cache; // TODO: WILL DELETE
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -68,6 +68,7 @@ pub mod sessions;
 pub mod state;
 pub mod store;
 pub mod url;
+pub mod sqlite_cache;
 
 pub use cache::{
     CacheDecision, CacheKey, CachePolicy, CacheProducerInfo, CacheRejectionReason, CacheSnapshot,

@@ -9,6 +9,7 @@
         "schemars",
         "scrapeable",
         "serde",
+        "sqlx",
         "stylesheet",
         "thiserror",
         "unparseable",
