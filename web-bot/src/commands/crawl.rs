@@ -1,7 +1,5 @@
 //! Crawl command implementation.
 
-//! Crawl command implementation.
-
 use clap::Args;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
