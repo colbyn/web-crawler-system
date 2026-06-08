@@ -5,8 +5,6 @@
 use clap::Args;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-
-use anyhow::Context;
 use serde_json::Value;
 use url::Url;
 use web_crawler_engine_v3::{
