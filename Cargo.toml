@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["web-bot","web-browser-driver","web-crawler-engine-v3"]
+
+[workspace.dependencies.chromiumoxide]
+git = "https://github.com/mattsse/chromiumoxide"
+branch = "main"
+# features = ["tokio", "tokio-runtime"]
+# default-features = false
