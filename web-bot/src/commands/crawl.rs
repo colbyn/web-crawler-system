@@ -3,8 +3,6 @@
 use clap::Args;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
-
-use anyhow::Context;
 use serde_json::Value;
 use url::Url;
 use web_crawler_engine_v3::{
@@ -19,15 +17,16 @@ use web_browser_driver::BrowserDriver;
 
 #[derive(Args, Debug)]
 pub struct CrawlArgs {
-    /// URLs to crawl (can also be provided via stdin)
-    #[arg()]
-    pub urls: Vec<String>,
+    /// URLs to crawl. Can be repeated. Use `-i -` to explicitly read from stdin.
+    /// Each value can contain multiple space-separated URLs.
+    #[arg(short = 'i', long = "input", action = clap::ArgAction::Append)]
+    pub inputs: Vec<String>,
 
-    /// Input format: text, ndjson, or json
+    /// Input format when reading from stdin or structured data
     #[arg(long, default_value = "text")]
     pub format: String,
 
-    /// JSON Pointer to extract the URL when using ndjson/json input
+    /// JSON Pointer to extract the URL (used with ndjson/json)
     #[arg(long)]
     pub url_pointer: Option<String>,
 
@@ -44,53 +43,37 @@ pub struct CrawlArgs {
     pub max_depth: u32,
 }
 
-/// Parse input from stdin based on format
-fn parse_input(args: &CrawlArgs) -> anyhow::Result<Vec<(Url, Option<Value>)>> {
-    let mut results = Vec::new();
-    let stdin = io::stdin();
-    let reader = stdin.lock();
+/// Collect raw input lines from `-i` flags and/or stdin.
+/// `-i -` forces reading from stdin.
+fn collect_input_lines(args: &CrawlArgs) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut read_stdin = false;
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        match args.format.as_str() {
-            "text" => {
-                let url = Url::parse(line).context("Invalid URL")?;
-                results.push((url, None));
+    for input in &args.inputs {
+        if input == "-" {
+            read_stdin = true;
+        } else {
+            for part in input.split_whitespace() {
+                if !part.is_empty() {
+                    lines.push(part.to_string());
+                }
             }
-            "ndjson" | "json" => {
-                let json: Value =
-                    serde_json::from_str(&line).context("Failed to parse JSON")?;
-
-                let url_str = if let Some(pointer) = &args.url_pointer {
-                    json.pointer(pointer)
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("URL not found at pointer `{}`", pointer))?
-                } else {
-                    json.get("url")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("No `url` field found in JSON"))?
-                };
-
-                let url = Url::parse(url_str).context("Invalid URL extracted from JSON")?;
-
-                let provenance = if args.attach_provenance {
-                    Some(json)
-                } else {
-                    None
-                };
-
-                results.push((url, provenance));
-            }
-            other => anyhow::bail!("Unsupported --format: {}", other),
         }
     }
 
-    Ok(results)
+    // Read stdin if `-i -` was used or if no -i flags were provided
+    if read_stdin || args.inputs.is_empty() {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+    }
+
+    Ok(lines)
 }
 
 pub async fn run(
@@ -98,16 +81,75 @@ pub async fn run(
     profile_root: &PathBuf,
     cache_root: &PathBuf,
 ) -> anyhow::Result<()> {
-    println!("Starting crawl...");
+    let raw_lines = collect_input_lines(&args)?;
 
-    let inputs = parse_input(&args)?;
-
-    if inputs.is_empty() {
-        println!("No URLs to crawl.");
+    if raw_lines.is_empty() {
+        println!("No URLs provided.");
         return Ok(());
     }
 
-    println!("Found {} URLs", inputs.len());
+    // Parse raw lines into (URL, optional provenance)
+    let mut parsed = Vec::new();
+
+    for line in raw_lines {
+        match args.format.as_str() {
+            "text" => {
+                if let Ok(url) = Url::parse(&line) {
+                    parsed.push((url, None));
+                } else {
+                    eprintln!("Skipping invalid URL: {}", line);
+                }
+            }
+            "ndjson" | "json" => {
+                let json: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("Skipping invalid JSON line");
+                        continue;
+                    }
+                };
+
+                let url_str = if let Some(pointer) = &args.url_pointer {
+                    match json.pointer(pointer).and_then(|v| v.as_str()) {
+                        Some(u) => u.to_string(),
+                        None => {
+                            eprintln!("URL not found at pointer `{}`", pointer);
+                            continue;
+                        }
+                    }
+                } else {
+                    match json.get("url").and_then(|v| v.as_str()) {
+                        Some(u) => u.to_string(),
+                        None => {
+                            eprintln!("No `url` field found in JSON");
+                            continue;
+                        }
+                    }
+                };
+
+                if let Ok(url) = Url::parse(&url_str) {
+                    let provenance = if args.attach_provenance {
+                        Some(json)
+                    } else {
+                        None
+                    };
+                    parsed.push((url, provenance));
+                } else {
+                    eprintln!("Invalid URL extracted: {}", url_str);
+                }
+            }
+            other => {
+                anyhow::bail!("Unsupported format: {}", other);
+            }
+        }
+    }
+
+    if parsed.is_empty() {
+        println!("No valid URLs to crawl after parsing.");
+        return Ok(());
+    }
+
+    println!("Crawling {} URLs...", parsed.len());
 
     let cache_store = FsCrawlCacheStore::new(cache_root);
     let driver = BrowserDriver::new(Default::default());
@@ -134,14 +176,12 @@ pub async fn run(
         profile_strategy,
     );
 
-    // Build requests
     let mut requests = Vec::new();
-    for (url, provenance) in inputs {
-        let provenance = provenance.unwrap_or_else(|| serde_json::json!({}));
-        requests.push(CrawlRequest::seed(url, provenance));
+    for (url, provenance) in parsed {
+        let prov = provenance.unwrap_or_else(|| serde_json::json!({}));
+        requests.push(CrawlRequest::seed(url, prov));
     }
 
-    // Run crawl
     let result = engine.crawl(requests).await?;
 
     // Summary
@@ -163,4 +203,3 @@ pub async fn run(
 
     Ok(())
 }
-

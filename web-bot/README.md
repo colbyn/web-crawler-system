@@ -1,16 +1,18 @@
 # web-bot
 
-Operational CLI for the web crawler system.
+**Operational CLI for the web crawler system.**
 
-`web-bot` lets you preemptively crawl content into a shared cache and inspect cached artifacts. It is designed to work alongside the `web-crawler-engine-v3` library.
+`web-bot` is a command-line tool for preemptively crawling web content into a shared filesystem cache and inspecting cached artifacts. It is designed to work alongside the `web-crawler-engine-v3` library.
 
 ## Features
 
-- Flexible input: plain text, NDJSON, or JSON
+- Flexible input formats: plain text, NDJSON, or JSON arrays
 - JSON Pointer support for extracting URLs from structured data
 - Optional provenance attachment from input JSON
-- Shared filesystem cache with the engine
-- Session rotation and health-aware browser management
+- Rich cache inspection (metadata + HTML snapshots)
+- Cache management (`remove`, `clear`, `stats`)
+- Health-aware browser session rotation
+- Shared cache with applications using the engine
 
 ## Building
 
@@ -18,66 +20,114 @@ Operational CLI for the web crawler system.
 cargo build --release -p web-bot
 ```
 
-The binary will be available at `target/release/web-bot`.
+The binary will be located at `target/release/web-bot`.
 
-## Usage
+## Commands
 
-### Crawl URLs
+| Command                    | Description                                      |
+|---------------------------|--------------------------------------------------|
+| `crawl`                   | Crawl URLs into the cache                        |
+| `cache lookup <url>`      | Show metadata for a cached URL                   |
+| `cache snapshot <url>`    | Print or save the HTML snapshot                  |
+| `cache remove <url>`      | Remove a specific URL from the cache             |
+| `cache clear`             | Delete all cached data                           |
+| `cache stats`             | Show cache disk usage statistics                 |
+
+## Usage Examples
+
+### Crawling
 
 ```bash
-# Simple text input (one URL per line)
+# Basic crawl (one URL per line via stdin)
 echo -e "https://example.com\nhttps://example.org" | web-bot crawl
 
-# From a file
-web-bot crawl --input seeds.txt
+# Crawl with limits
+web-bot crawl --max-pages 300 --max-depth 2
 
-# NDJSON with URL pointer
-cat companies.ndjson | web-bot crawl --format ndjson --url-pointer "/website"
+# NDJSON input with JSON Pointer
+cat companies.ndjson | web-bot crawl \
+  --format ndjson \
+  --url-pointer "/website"
 
-# With provenance attached
-cat companies.ndjson | web-bot crawl --format ndjson --url-pointer "/website" --attach-provenance
-
-# Limit crawl size
-web-bot crawl --max-pages 100 --max-depth 2
+# Attach full JSON object as provenance
+cat leads.ndjson | web-bot crawl \
+  --format ndjson \
+  --url-pointer "/url" \
+  --attach-provenance
 ```
 
-### Cache Inspection
+### Cache Operations
 
 ```bash
-# Check if a URL is cached
-web-bot cache lookup https://example.com
+# View metadata for a cached page
+web-bot cache lookup https://example.com/about
 
-# Show cache statistics
+# Print the HTML snapshot to stdout
+web-bot cache snapshot https://example.com/about
+
+# Save snapshot to a file
+web-bot cache snapshot https://example.com/about -o about.html
+
+# Remove one URL from the cache
+web-bot cache remove https://example.com/old-page
+
+# Force remove without confirmation
+web-bot cache remove https://example.com/old-page --force
+
+# View cache statistics
+web-bot cache stats
+
+# Clear the entire cache (with confirmation)
+web-bot cache clear
+
+# Force clear everything
+web-bot cache clear --force
+```
+
+### Common Workflows
+
+**Pre-crawling content before a job:**
+
+```bash
+cat production-urls.txt | web-bot crawl --max-pages 2000
 web-bot cache stats
 ```
 
-## Common Options
+**Debugging / inspecting a specific page:**
 
-| Flag                    | Description                              | Default      |
-|-------------------------|------------------------------------------|--------------|
-| `--profile-root`        | Browser profile directory                | `./profiles` |
-| `--cache-root`          | Page cache directory                     | `./cache`    |
-| `--format`              | Input format (`text`, `ndjson`, `json`)  | `text`       |
-| `--url-pointer`         | JSON Pointer to extract URL              | -            |
-| `--attach-provenance`   | Attach full JSON object as provenance    | `false`      |
-| `--max-pages`           | Max pages to crawl                       | `50`         |
-| `--max-depth`           | Max hop depth                            | `1`          |
+```bash
+web-bot cache lookup https://example.com/tricky-page
+web-bot cache snapshot https://example.com/tricky-page | head -100
+```
 
-## Input Formats
+**Extracting cached HTML for offline analysis:**
 
-- **`text`**: One URL per line
-- **`ndjson`**: One JSON object per line
-- **`json`**: JSON array of objects
+```bash
+web-bot cache snapshot https://example.com/report -o report.html
+```
 
-When using `ndjson` or `json`, use `--url-pointer` to specify where the URL lives (e.g. `/website` or `/contact/url`).
+## Configuration
+
+| Flag                | Description                        | Default      |
+|---------------------|------------------------------------|--------------|
+| `--profile-root`    | Browser profile directory          | `./profiles` |
+| `--cache-root`      | Page cache directory               | `./cache`    |
+| `--format`          | Input format (`text` / `ndjson`)   | `text`       |
+| `--url-pointer`     | JSON Pointer to extract URL        | -            |
+| `--attach-provenance` | Attach original JSON as provenance | `false`    |
+| `--max-pages`       | Max pages to crawl                 | `50`         |
+| `--max-depth`       | Max crawl depth                    | `1`          |
 
 ## Philosophy
 
-`web-bot` is an **operational tool**. It focuses on:
+`web-bot` is an **operational / data-preparation tool**. It focuses on:
 
 - Populating the shared cache ahead of time
-- Making cache inspection easy
-- Supporting flexible data pipelines via stdin/NDJSON
+- Making cache inspection and management easy
+- Supporting flexible data pipelines (stdin, NDJSON, JSON Pointers)
 
-Complex business logic and provenance interpretation belong in applications using the `web-crawler-engine-v3` library directly.
+Complex business logic, entity resolution, and rich provenance interpretation belong in applications that use the `web-crawler-engine-v3` library directly.
 
+## License
+
+Colbyn Wadman
