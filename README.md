@@ -1,1 +1,4 @@
-See [./web-bot](./web-bot/README.md)
+# Web Bot
+
+- [Project](./web-bot/README.md)
+- [web-bot/README.md](./web-bot/README.md)

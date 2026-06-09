@@ -381,6 +381,13 @@ where
             None
         };
 
+        if html.is_none() && self.policy.snapshot.capture_html {
+            tracing::warn!(
+                requested_url = %request.requested_url,
+                "page opened but html capture failed; not saving cache entry"
+            );
+        }
+
         let snapshot = match &html {
             Some(h) => SnapshotDecision::Captured {
                 html_bytes: h.len(),
@@ -471,9 +478,23 @@ where
                         payloads: vec![snapshot_payload],
                         tags: vec![],
                     };
-
-                    if let Err(e) = cache.put(&cache_entry).await {
-                        tracing::warn!("failed to save sqlite cache entry: {}", e);
+                    
+                    match cache.put(&cache_entry).await {
+                        Ok(()) => {
+                            tracing::debug!(
+                                requested_url = %request.requested_url,
+                                key_digest = %crate::sqlite_cache::cache_key_digest(&cache_key)
+                                    .unwrap_or_else(|_| "<digest-error>".into()),
+                                "saved sqlite cache entry"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                requested_url = %request.requested_url,
+                                error = %e,
+                                "failed to save sqlite cache entry"
+                            );
+                        }
                     }
                 }
             }

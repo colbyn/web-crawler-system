@@ -111,9 +111,11 @@ impl SqliteCache {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_cache_entries_requested_host ON cache_entries(requested_host);"
         ).execute(&self.pool).await?;
+
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_cache_entries_final_host ON cache_entries(final_host);"
         ).execute(&self.pool).await?;
+
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_cache_entries_stored_at ON cache_entries(stored_at_unix_ms);"
         ).execute(&self.pool).await?;
@@ -122,14 +124,15 @@ impl SqliteCache {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_payloads (
-                payload_id  TEXT PRIMARY KEY,
                 key_digest  TEXT NOT NULL REFERENCES cache_entries(key_digest) ON DELETE CASCADE,
+                payload_id  TEXT NOT NULL,
                 role        TEXT NOT NULL,
                 media_type  TEXT,
                 compression TEXT NOT NULL,
                 sha256_hex  TEXT NOT NULL,
                 byte_len    INTEGER NOT NULL,
-                body        BLOB NOT NULL
+                body        BLOB NOT NULL,
+                PRIMARY KEY (key_digest, payload_id)
             );
             "#,
         )
@@ -196,8 +199,14 @@ impl SqliteCache {
     pub async fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
         match self.load_entry_raw(key).await {
             Ok(Some(entry)) => Some(entry),
-            Ok(None) => None,
-            Err(_) => None, // graceful degradation
+            Ok(None) => {
+                tracing::debug!(?key, "sqlite cache miss: no row");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(?key, error = %err, "sqlite cache miss: load failed");
+                None
+            }
         }
     }
 

@@ -44,7 +44,12 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
+
+    tracing::warn!(
+        "HELLO WORLD"
+    );
 
     let cli = Cli::parse();
 
@@ -59,4 +64,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
