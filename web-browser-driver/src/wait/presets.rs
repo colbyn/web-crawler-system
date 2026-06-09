@@ -33,6 +33,7 @@ use crate::{
     BrowserPage,
     DocumentReadyState,
     PageTelemetryBuilder,
+    PageTelemetryEventKind,
 };
 
 /// Practical page-readiness presets.
@@ -195,6 +196,25 @@ where
         Err(err) => {
             if matches!(err, BrowserDriverError::WaitTimeout(_)) {
                 telemetry.mark_wait_timed_out(elapsed);
+
+                // Lenient crawler rule:
+                //
+                // A wait timeout is not necessarily a bad page. Many real-world
+                // sites never become "quiet" because analytics, ads, fonts,
+                // chat widgets, maps, or broken third-party scripts keep
+                // bubbling forever.
+                //
+                // If the DOM is already usable, accept the page and preserve the
+                // timeout in telemetry instead of turning scrapeable evidence
+                // into a hard crawl failure.
+                if telemetry.telemetry().dom_was_available() {
+                    telemetry.push_event(
+                        PageTelemetryEventKind::Other,
+                        format!("soft-accepted wait timeout because DOM was available: {err}"),
+                    );
+
+                    return Ok(());
+                }
             }
 
             Err(err)
