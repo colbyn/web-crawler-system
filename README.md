@@ -36,7 +36,8 @@ Inspect the cache:
 
 ```bash
 cargo run --release -p web-bot -- cache stats
-cargo run --release -p web-bot -- cache list-by-tag run:manual-debug
+cargo run --release -p web-bot -- cache list --tag run:manual-debug
+cargo run --release -p web-bot -- cache tags --kind run
 ```
 
 ## Configuration Model
@@ -93,6 +94,56 @@ enabled = true
 namespace = "default"
 ```
 
+## Cache Model
+
+The SQLite cache stores reusable page artifacts. Tags are a secondary association layer over those artifacts.
+
+A cached artifact answers:
+
+```text
+what page evidence did we capture?
+```
+
+A tag answers:
+
+```text
+why does some caller care about this artifact?
+```
+
+Tags use this form:
+
+```text
+kind:key
+```
+
+Examples:
+
+```text
+entity:business-123
+category:electricians
+run:manual-debug
+batch:2026-06-09
+```
+
+Common cache commands:
+
+```bash
+web-bot cache lookup https://example.com
+web-bot cache snapshot https://example.com -o snapshot.html
+
+web-bot cache list
+web-bot cache list --tag entity:business-123
+web-bot cache list --tag-kind entity
+
+web-bot cache tags
+web-bot cache tags --kind entity
+web-bot cache tags https://example.com
+
+web-bot cache tag https://example.com entity:business-123
+web-bot cache untag https://example.com entity:business-123
+web-bot cache delete --tag run:manual-debug
+```
+
 ## Documentation
 
 See the full CLI documentation:
@@ -102,4 +153,3 @@ See the full CLI documentation:
 ## License
 
 Copyright 2026 Colbyn Wadman
-
