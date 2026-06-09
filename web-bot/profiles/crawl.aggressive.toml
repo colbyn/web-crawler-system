@@ -6,18 +6,18 @@
 # cat urls.txt | web-bot crawl --config web-bot/config/crawl.aggressive.toml
 #
 
-[input]
-urls = ["-"]
-format = "text"
-url-pointer = "/url"
-attach-provenance = false
+# [input]
+# urls = ["-"]
+# format = "text"
+# url-pointer = "/url"
+# attach-provenance = false
 
-[tags]
-global = ["run:aggressive"]
-pointers = []
+# [tags]
+# global = ["run:aggressive"]
+# pointers = []
 
-[output]
-format = "human"
+# [output]
+# format = "human"
 
 [budget]
 pages = 25
@@ -37,6 +37,6 @@ timeout-secs = 45
 strategy = "by-seed-host"
 key = "default"
 
-[cache]
-enabled = true
-namespace = "default"
+# [cache]
+# enabled = true
+# namespace = "default"
