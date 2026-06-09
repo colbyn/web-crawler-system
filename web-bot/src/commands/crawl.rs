@@ -20,8 +20,27 @@
 //! all pages crawled for category:electricians
 //! all pages crawled for run:manual-debug
 //! ```
+//!
+//! ## Budget model
+//!
+//! The page budget is per seed. `--max-pages-per-seed 5` means each seed may
+//! produce up to five opened page results, not that the entire batch is limited
+//! to five pages.
+//!
+//! ## Concurrency model
+//!
+//! The crawler supports hybrid concurrency:
+//!
+//! ```text
+//! max_concurrent_pages = global in-flight page jobs
+//! max_sessions = live Chromium browser sessions
+//! max_concurrent_pages_per_session = concurrent tabs/pages per browser session
+//! ```
 
-use clap::Args;
+use clap::{
+    Args,
+    ValueEnum,
+};
 use serde_json::Value;
 use std::io::{
     self,
@@ -30,9 +49,13 @@ use std::io::{
 };
 use std::path::PathBuf;
 use url::Url;
-use web_browser_driver::BrowserDriver;
+use web_browser_driver::{
+    BrowserDriver,
+    BrowserProfileKey,
+};
 use web_crawler_engine_v3::{
     config::{
+        CrawlConcurrency,
         CrawlEngineConfig,
         CrawlLimits,
     },
@@ -43,6 +66,21 @@ use web_crawler_engine_v3::{
     CrawlEngine,
     SqliteCache,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliProfileStrategy {
+    /// Every request uses the same browser profile.
+    Single,
+
+    /// Use caller-provided profile keys when available, otherwise fallback.
+    CallerProvidedOrSingle,
+
+    /// Derive browser profile from the requested URL host.
+    ByHost,
+
+    /// Derive browser profile from the original seed URL host.
+    BySeedHost,
+}
 
 #[derive(Args, Debug)]
 pub struct CrawlArgs {
@@ -92,13 +130,72 @@ pub struct CrawlArgs {
     #[arg(long)]
     pub json: bool,
 
-    #[arg(long, default_value_t = 50)]
-    pub max_pages: usize,
+    /// Maximum opened pages per original seed.
+    ///
+    /// This is the primary crawl budget.
+    #[arg(long, default_value_t = 10)]
+    pub max_pages_per_seed: usize,
 
+    /// Deprecated compatibility alias for --max-pages-per-seed.
+    ///
+    /// If supplied, this overrides --max-pages-per-seed.
+    #[arg(long, hide = true)]
+    pub max_pages: Option<usize>,
+
+    /// Optional global emergency brake for the whole crawl invocation.
+    #[arg(long)]
+    pub max_total_pages: Option<usize>,
+
+    /// Maximum hop depth from each original seed.
+    ///
+    /// Seeds are depth 0. Links discovered from seeds are depth 1.
     #[arg(long, default_value_t = 1)]
     pub max_depth: u32,
 
-    /// Disable cache lookup/storage for this crawl
+    /// Maximum URLs retained in the frontier.
+    #[arg(long, default_value_t = 100_000)]
+    pub max_frontier_items: usize,
+
+    /// Maximum page jobs in flight across the whole crawl.
+    #[arg(long, default_value_t = 8)]
+    pub max_concurrent_pages: usize,
+
+    /// Maximum live Chromium browser sessions.
+    #[arg(long, default_value_t = 4)]
+    pub max_sessions: usize,
+
+    /// Maximum concurrent pages/tabs per browser session.
+    #[arg(long, default_value_t = 2)]
+    pub max_concurrent_pages_per_session: usize,
+
+    /// Maximum concurrent cache operations.
+    ///
+    /// Currently reserved for engine/cache backpressure.
+    #[arg(long, default_value_t = 32)]
+    pub max_concurrent_cache_ops: usize,
+
+    /// Rotate each browser session after this many page opens.
+    #[arg(long, default_value_t = 150)]
+    pub max_pages_per_session: usize,
+
+    /// Browser profile assignment strategy.
+    ///
+    /// `by-seed-host` is usually the best operational default: it gives each
+    /// seed domain Chrome cache warmth without mixing unrelated domains into one
+    /// giant browser profile.
+    #[arg(long, value_enum, default_value_t = CliProfileStrategy::BySeedHost)]
+    pub profile_strategy: CliProfileStrategy,
+
+    /// Fallback/single browser profile key.
+    ///
+    /// Used by `single` and `caller-provided-or-single`.
+    #[arg(long, default_value = "default")]
+    pub profile_key: String,
+
+    /// Disable cache lookup/storage for this crawl.
+    ///
+    /// Note: this disables the crawler's SQLite artifact cache. It does not
+    /// necessarily disable Chromium's own profile cache.
     #[arg(long)]
     pub no_cache: bool,
 }
@@ -247,6 +344,24 @@ fn tags_from_json_pointers(
     Ok(tags)
 }
 
+fn profile_strategy_from_args(args: &CrawlArgs) -> BrowserProfileStrategy {
+    let fallback = BrowserProfileKey::new(args.profile_key.clone());
+
+    match args.profile_strategy {
+        CliProfileStrategy::Single => BrowserProfileStrategy::Single {
+            key: fallback,
+        },
+
+        CliProfileStrategy::CallerProvidedOrSingle => {
+            BrowserProfileStrategy::CallerProvidedOrSingle { fallback }
+        }
+
+        CliProfileStrategy::ByHost => BrowserProfileStrategy::ByHost,
+
+        CliProfileStrategy::BySeedHost => BrowserProfileStrategy::BySeedHost,
+    }
+}
+
 pub async fn run(
     args: CrawlArgs,
     profile_root: &PathBuf,
@@ -272,6 +387,14 @@ pub async fn run(
             "--attach-provenance is currently ignored; use --tag and --tag-pointer instead"
         );
     }
+
+    if args.max_pages.is_some() {
+        tracing::warn!(
+            "--max-pages is deprecated; use --max-pages-per-seed instead"
+        );
+    }
+
+    let max_pages_per_seed = args.max_pages.unwrap_or(args.max_pages_per_seed);
 
     let mut parsed: Vec<(Url, Vec<CacheTag>)> = Vec::new();
 
@@ -332,7 +455,25 @@ pub async fn run(
         return Ok(());
     }
 
-    eprintln!("Crawling {} URLs...", parsed.len());
+    eprintln!("Crawling {} seed URLs...", parsed.len());
+    eprintln!(
+        "Budgets: max_pages_per_seed={} max_depth={} max_total_pages={:?}",
+        max_pages_per_seed,
+        args.max_depth,
+        args.max_total_pages,
+    );
+    eprintln!(
+        "Concurrency: max_concurrent_pages={} max_sessions={} max_concurrent_pages_per_session={} max_pages_per_session={}",
+        args.max_concurrent_pages,
+        args.max_sessions,
+        args.max_concurrent_pages_per_session,
+        args.max_pages_per_session,
+    );
+    eprintln!(
+        "Profile strategy: {:?} profile_key={}",
+        args.profile_strategy,
+        args.profile_key,
+    );
 
     if !global_tags.is_empty() {
         eprintln!(
@@ -366,16 +507,26 @@ pub async fn run(
 
     let config = CrawlEngineConfig {
         limits: CrawlLimits {
-            max_pages: args.max_pages,
+            max_pages_per_seed,
             max_hop_depth: args.max_depth,
-            max_frontier_items: 10_000,
+            max_frontier_items: args.max_frontier_items,
+            max_total_pages: args.max_total_pages,
         },
+
+        concurrency: CrawlConcurrency {
+            max_concurrent_pages: args.max_concurrent_pages,
+            max_sessions: args.max_sessions,
+            max_concurrent_pages_per_session: args.max_concurrent_pages_per_session,
+            max_concurrent_cache_ops: args.max_concurrent_cache_ops,
+            max_pages_per_session: args.max_pages_per_session,
+        },
+
         page_open_timeout: std::time::Duration::from_secs(45),
         cache_enabled: !args.no_cache,
     };
 
     let policy = CrawlPolicy::default();
-    let profile_strategy = BrowserProfileStrategy::default();
+    let profile_strategy = profile_strategy_from_args(&args);
 
     let engine: CrawlEngine<serde_json::Value> = CrawlEngine::new(
         config,
@@ -405,6 +556,7 @@ pub async fn run(
     } else {
         let mut success = 0;
         let mut failed = 0;
+        let mut skipped = 0;
         let mut from_cache = 0;
 
         for page in &result.pages {
@@ -424,14 +576,17 @@ pub async fn run(
                     failed += 1;
                 }
 
-                _ => {}
+                web_crawler_engine_v3::output::CrawlPageOutcome::Skipped { .. } => {
+                    skipped += 1;
+                }
             }
         }
 
         eprintln!("\n=== Crawl Complete ===");
-        eprintln!("Total processed: {}", result.pages.len());
-        eprintln!("  Successful:    {} ({} from cache)", success, from_cache);
-        eprintln!("  Failed:        {}", failed);
+        eprintln!("Total results:  {}", result.pages.len());
+        eprintln!("  Successful:   {} ({} from cache)", success, from_cache);
+        eprintln!("  Failed:       {}", failed);
+        eprintln!("  Skipped:      {}", skipped);
     }
 
     Ok(())

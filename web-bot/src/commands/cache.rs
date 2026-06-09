@@ -227,12 +227,10 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
 
 fn key_for_url(
     url: &str,
-    profile_key: &str,
     namespace: Option<String>,
 ) -> anyhow::Result<CacheKey> {
     Ok(CacheKey::for_request(
         url::Url::parse(url)?,
-        BrowserProfileKey::new(profile_key),
         namespace,
     ))
 }
@@ -279,7 +277,7 @@ async fn lookup_metadata(
     json: bool,
     full: bool,
 ) -> anyhow::Result<()> {
-    let cache_key = key_for_url(url, profile_key, namespace)?;
+    let cache_key = key_for_url(url, namespace)?;
 
     match cache.get(&cache_key).await {
         Some(entry) => {
@@ -385,7 +383,7 @@ async fn get_snapshot(
     namespace: Option<String>,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let cache_key = key_for_url(url, profile_key, namespace)?;
+    let cache_key = key_for_url(url, namespace)?;
 
     let entry = cache
         .get(&cache_key)
@@ -438,7 +436,7 @@ async fn remove_url(
         }
     }
 
-    let cache_key = key_for_url(url, profile_key, namespace)?;
+    let cache_key = key_for_url(url, namespace)?;
     let key_digest = cache_key_digest(&cache_key)?;
 
     let result = sqlx::query("DELETE FROM cache_entries WHERE key_digest = ?")
@@ -567,7 +565,7 @@ async fn tag_url(
         anyhow::bail!("at least one tag is required");
     }
 
-    let cache_key = key_for_url(url, profile_key, namespace)?;
+    let cache_key = key_for_url(url, namespace)?;
 
     if cache.get(&cache_key).await.is_none() {
         anyhow::bail!("URL not found in cache: {}", url);

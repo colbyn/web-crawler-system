@@ -5,7 +5,7 @@
 //! It coordinates:
 //!
 //! - crawl run state,
-//! - frontier scheduling,
+//! - seed-aware frontier scheduling,
 //! - visit policy,
 //! - browser session/profile assignment,
 //! - cache lookup,
@@ -42,10 +42,43 @@
 //! The engine remains generic over `P`, but `P` is currently a phantom typed lane
 //! carried by request/result shapes. Durable caller association should happen via
 //! tags, not by trying to serialize arbitrary `P` into cache artifacts.
+//!
+//! ## Concurrency model
+//!
+//! The coordinator owns `CrawlRunState`. Workers do not mutate the frontier,
+//! visited sets, budgets, or result list.
+//!
+//! The coordinator:
+//!
+//! - pops frontier items,
+//! - dedupes,
+//! - checks visit policy,
+//! - reserves per-seed page slots,
+//! - dispatches page jobs,
+//! - records completed results,
+//! - expands the frontier from completed opened pages.
+//!
+//! Workers:
+//!
+//! - try cache,
+//! - lease browser page capacity,
+//! - open/extract/snapshot,
+//! - save cache,
+//! - return one `CrawlPageResult`.
+//!
+//! This keeps the mutable crawl brain in one place while browser/page work runs
+//! concurrently.
 
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use colored_json::Paint;
+use futures::{
+    stream::FuturesUnordered,
+    StreamExt,
+};
 use serde::{
     de::DeserializeOwned,
     Serialize,
@@ -53,6 +86,7 @@ use serde::{
 use web_browser_driver::{
     AnchorExtractor,
     BrowserDriver,
+    BrowserSession,
     OpenPageOptions,
     PageInfoExtractor,
 };
@@ -290,15 +324,13 @@ where
     ) -> CrawlEngineResult<CrawlRunResult<P>> {
         let mut state = CrawlRunState::new(self.config.limits.clone(), seeds);
 
-        // Session pool with health-aware + page-count rotation.
-        //
-        // Rotation is important for long-running batch crawls to prevent memory
-        // leaks, CDP degradation, and profile contamination.
-        let mut sessions = SessionPool::new(
-            &self.browser_driver,
+        let sessions = SessionPool::new(
+            self.browser_driver.clone(),
             self.profile_strategy.clone(),
             self.profile_root.clone(),
-            150,
+            self.config.concurrency.max_sessions,
+            self.config.concurrency.max_pages_per_session,
+            self.config.concurrency.max_concurrent_pages_per_session,
         )
         .with_rotation_callback(|profile_key, reason| {
             tracing::info!(
@@ -309,74 +341,53 @@ where
             );
         });
 
-        while state.should_continue() {
-            let Some(item) = state.pop_next() else {
-                break;
-            };
+        let mut inflight = FuturesUnordered::new();
+        let max_concurrent_pages = self.config.concurrency.max_concurrent_pages.max(1);
 
-            let request = item.request;
+        loop {
+            // Fill the in-flight set up to the configured global page
+            // concurrency. The coordinator remains the only owner of
+            // `CrawlRunState`.
+            while inflight.len() < max_concurrent_pages && state.should_continue() {
+                let Some(item) = state.pop_next() else {
+                    break;
+                };
 
-            if state.has_visited_fetch_key(&request) {
-                eprintln!("👻 already seen, skipping {}", request.requested_url);
-                continue;
-            }
+                let request = item.request;
 
-            state.mark_visited(&request);
+                if state.has_visited_fetch_key(&request) {
+                    eprintln!("👻 already seen, skipping {}", request.requested_url);
+                    continue;
+                }
 
-            match self.policy.evaluate_visit(&request, &self.config.limits) {
-                VisitDecision::Visit => {}
+                match self.policy.evaluate_visit(&request, &self.config.limits) {
+                    VisitDecision::Visit => {}
 
-                VisitDecision::Skip { reason } => {
+                    VisitDecision::Skip { reason } => {
+                        state.mark_visited(&request);
+
+                        let result = CrawlPageResult {
+                            request,
+                            cache_key: None,
+                            cache_decision: None,
+                            outcome: CrawlPageOutcome::Skipped { reason },
+                        };
+
+                        self.sink.record_page(&result).await?;
+                        state.record_page(result);
+                        continue;
+                    }
+                }
+
+                if !state.reserve_seed_slot(&request) {
+                    state.mark_visited(&request);
+
                     let result = CrawlPageResult {
                         request,
                         cache_key: None,
                         cache_decision: None,
-                        outcome: CrawlPageOutcome::Skipped { reason },
-                    };
-
-                    self.sink.record_page(&result).await?;
-                    state.record_page(result);
-                    continue;
-                }
-            }
-
-            let assignment = SessionScheduler::new(self.profile_strategy.clone())
-                .assign_profile(&request);
-
-            let cache_key = CacheKey::for_request(
-                request.requested_url.clone(),
-                assignment.key.clone(),
-                None,
-            );
-
-            // Fast path: try cache before acquiring a browser session.
-            //
-            // A cache hit behaves like replayed page evidence. Cached artifacts
-            // contain extracted anchors, so they still expand the frontier.
-            if let Some(cached_result) = self.try_cache(&request, &cache_key).await? {
-                self.sink.record_page(&cached_result).await?;
-                state.record_page(cached_result.clone());
-
-                if let CrawlPageOutcome::Opened { anchors, .. } = &cached_result.outcome {
-                    state.expand_from_anchors(&request, anchors, &self.policy);
-                }
-
-                continue;
-            }
-
-            // Live path.
-            let session = match sessions.get_or_start(&request).await {
-                Ok(session) => session,
-
-                Err(err) => {
-                    let result = CrawlPageResult {
-                        request,
-                        cache_key: Some(cache_key),
-                        cache_decision: None,
-                        outcome: CrawlPageOutcome::Failed {
-                            error: err.to_string(),
-                            retryable: err.is_retryable_environment_failure(),
-                            should_terminate_session: true,
+                        outcome: CrawlPageOutcome::Skipped {
+                            reason: "seed page budget exhausted".into(),
                         },
                     };
 
@@ -384,33 +395,123 @@ where
                     state.record_page(result);
                     continue;
                 }
-            };
 
-            let result = self
-                .crawl_live_page(&request, cache_key, assignment, session)
-                .await?;
+                state.mark_visited(&request);
 
-            if matches!(
-                &result.outcome,
-                CrawlPageOutcome::Failed {
-                    should_terminate_session: true,
-                    ..
-                }
-            ) {
-                sessions.terminate_for_request(&request).await;
+                let assignment = SessionScheduler::new(self.profile_strategy.clone())
+                    .assign_profile(&request);
+
+                let cache_key = CacheKey::for_request(
+                    request.requested_url.clone(),
+                    None,
+                );
+
+                let sessions = sessions.clone();
+
+                inflight.push(async move {
+                    self.crawl_one_request(
+                        request,
+                        cache_key,
+                        assignment,
+                        sessions,
+                    )
+                    .await
+                });
             }
 
-            self.sink.record_page(&result).await?;
-            state.record_page(result.clone());
+            if inflight.is_empty() {
+                break;
+            }
 
-            if let CrawlPageOutcome::Opened { anchors, .. } = &result.outcome {
-                state.expand_from_anchors(&request, anchors, &self.policy);
+            let Some(result) = inflight.next().await else {
+                break;
+            };
+
+            let result = result?;
+
+            self.sink.record_page(&result).await?;
+
+            let opened_anchors = match &result.outcome {
+                CrawlPageOutcome::Opened { anchors, .. } => Some(anchors.clone()),
+                _ => None,
+            };
+
+            let request = result.request.clone();
+
+            state.complete_reserved_page(result);
+
+            if let Some(anchors) = opened_anchors {
+                state.expand_from_anchors(&request, &anchors, &self.policy);
             }
         }
 
         sessions.shutdown_all().await;
 
         Ok(state.finish())
+    }
+
+    /// Execute one page request.
+    ///
+    /// This method does not mutate crawl state. It may be run concurrently with
+    /// other page jobs.
+    ///
+    /// Flow:
+    ///
+    /// - try cache,
+    /// - if cache misses, lease browser page capacity,
+    /// - open/extract/snapshot live page,
+    /// - save cache,
+    /// - return exactly one page result.
+    async fn crawl_one_request(
+        &self,
+        request: CrawlRequest<P>,
+        cache_key: CacheKey,
+        assignment: BrowserProfileAssignment,
+        sessions: SessionPool,
+    ) -> CrawlEngineResult<CrawlPageResult<P>> {
+        // Fast path: try cache before acquiring browser page capacity.
+        //
+        // A cache hit behaves like replayed page evidence. Cached artifacts
+        // contain extracted anchors, so they still expand the frontier once the
+        // coordinator receives the result.
+        if let Some(cached_result) = self.try_cache(&request, &cache_key).await? {
+            return Ok(cached_result);
+        }
+
+        let lease = match sessions.lease_page_slot(&request).await {
+            Ok(lease) => lease,
+
+            Err(err) => {
+                return Ok(CrawlPageResult {
+                    request,
+                    cache_key: Some(cache_key),
+                    cache_decision: None,
+                    outcome: CrawlPageOutcome::Failed {
+                        error: err.to_string(),
+                        retryable: err.is_retryable_environment_failure(),
+                        should_terminate_session: err.should_terminate_session(),
+                    },
+                });
+            }
+        };
+
+        let session = lease.session();
+
+        let result = self
+            .crawl_live_page(&request, cache_key, assignment, session)
+            .await?;
+
+        if matches!(
+            &result.outcome,
+            CrawlPageOutcome::Failed {
+                should_terminate_session: true,
+                ..
+            }
+        ) {
+            sessions.terminate_for_request(&request).await;
+        }
+
+        Ok(result)
     }
 
     /// Execute a live browser crawl for a single frontier item.
@@ -427,7 +528,7 @@ where
         request: &CrawlRequest<P>,
         cache_key: CacheKey,
         assignment: BrowserProfileAssignment,
-        session: &mut web_browser_driver::BrowserSession,
+        session: Arc<BrowserSession>,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
         eprintln!(
             "{}",
@@ -455,6 +556,7 @@ where
         };
 
         let page_info = PageInfoExtractor::extract(&opened.page).await.ok();
+
         let anchors = AnchorExtractor::extract(&opened.page)
             .await
             .unwrap_or_default();

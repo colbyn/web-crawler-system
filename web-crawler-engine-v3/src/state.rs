@@ -1,50 +1,72 @@
 //! Crawl run state.
 //!
-//! This module owns the mutable state for a single crawl invocation.
+//! Owns the frontier, visited tracking, result accumulation, per-seed budgets,
+//! and frontier expansion.
 //!
-//! It keeps the engine loop small by managing:
+//! This keeps the main crawl loop focused on orchestration rather than
+//! bookkeeping.
 //!
-//! - the frontier,
-//! - queued URL tracking,
-//! - visited URL tracking,
-//! - page result accumulation,
-//! - crawl limits,
-//! - expansion from discovered anchors.
+//! # Per-seed crawl budgets
 //!
-//! ## URL dedupe
+//! The primary page budget is per original seed, not global.
 //!
-//! The state tracks normalized frontier/fetch keys so the same crawl run does
-//! not repeatedly visit equivalent URLs.
-//!
-//! This is intentionally run-local. Durable cross-run reuse belongs to the
-//! SQLite cache.
-//!
-//! ## Tag inheritance
-//!
-//! Seed/request tags must flow into discovered pages. This is what lets callers
-//! later query:
+//! A caller may pipe 100,000 seeds into the engine. Each seed should receive its
+//! own crawl budget:
 //!
 //! ```text
-//! all cached pages reached for entity X
-//! all cached pages reached for category Y
-//! all cached pages reached during debug run Z
+//! max_pages_per_seed = 5
+//! seed A may open up to 5 pages
+//! seed B may open up to 5 pages
+//! seed C may open up to 5 pages
+//! ...
 //! ```
 //!
-//! This module therefore does not manually rebuild child requests field by
-//! field. It uses [`CrawlRequest::discovered_from`] so inheritance is centralized
-//! in the input model.
+//! `max_total_pages` remains only as an optional global emergency brake.
 //!
-//! The key invariant is:
+//! # Reservation model
 //!
-//! ```text
-//! parent request tags == child request inherited tags
-//! ```
+//! The state tracks both:
 //!
-//! unless a future policy explicitly adds or removes tags.
+//! - opened page count per seed,
+//! - in-flight reserved page slots per seed.
+//!
+//! The in-flight lane matters once `engine.rs` dispatches concurrent page jobs.
+//! Without reservations, the coordinator could accidentally launch more work for
+//! a seed than its budget allows before completed results come back.
+//!
+//! # Counting semantics
+//!
+//! Only `Opened` page results consume seed page budget.
+//!
+//! This includes cache hits that replay usable page evidence, because they still
+//! produce page facts and may expand the frontier.
+//!
+//! Skipped and failed results are recorded, but they do not consume page budget.
+//!
+//! # Run-local fetch dedupe
+//!
+//! The SQLite cache may dedupe artifacts by URL-level cache identity, but the
+//! crawl run must not erase caller associations before they reach the cache.
+//!
+//! Therefore queued/visited fetch keys are not merely normalized URLs. They also
+//! include seed context and inherited request tags. This allows two callers,
+//! entities, categories, or runs to point at the same URL and still flow through
+//! the cache path so their tags can be merged onto the shared artifact.
+//!
+//! Within one seed/tag context, normalized URL dedupe still prevents loops and
+//! repeated frontier spam.
 
-use std::collections::HashSet;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 use colored_json::Paint;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use url::Url;
 use web_browser_driver::ExtractedAnchor;
 
 use crate::{
@@ -53,8 +75,12 @@ use crate::{
         FrontierItem,
         FrontierQueue,
     },
-    input::CrawlRequest,
+    input::{
+        CrawlRequest,
+        SeedGroupId,
+    },
     output::{
+        CrawlPageOutcome,
         CrawlPageResult,
         CrawlRunResult,
     },
@@ -62,28 +88,92 @@ use crate::{
         CrawlPolicy,
         ScopeDecision,
     },
+    sqlite_cache::CacheTag,
     url::{
         NormalizedUrl,
         UrlNormalizer,
     },
 };
 
+/// Seed-local crawl budget identity.
+///
+/// `seed_url` alone is often enough, but `seed_group_id` prevents accidental
+/// budget merging when the same seed URL appears in distinct caller-supplied
+/// groups.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SeedBudgetKey {
+    pub seed_group_id: Option<SeedGroupId>,
+    pub seed_url: Url,
+}
+
+impl SeedBudgetKey {
+    pub fn from_request<P>(request: &CrawlRequest<P>) -> Self {
+        Self {
+            seed_group_id: request.seed_group_id,
+            seed_url: request.seed_url.clone(),
+        }
+    }
+}
+
+/// Run-local fetch identity.
+///
+/// This is intentionally broader than a normalized URL and narrower than a
+/// request ID.
+///
+/// The cache artifact may be shared by URL, but the crawl path must preserve
+/// caller associations. If two seed requests point at the same URL with
+/// different tags, both should be allowed to reach the cache path so both tag
+/// sets can be merged onto the shared artifact.
+///
+/// Within the same seed/tag context, normalized URL dedupe still prevents loops,
+/// repeated anchor spam, and duplicate queued work.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FetchVisitKey {
+    seed_group_id: Option<SeedGroupId>,
+    seed_url: Url,
+    tags: Vec<CacheTag>,
+    normalized_url: NormalizedUrl,
+}
+
+impl FetchVisitKey {
+    fn from_request<P>(request: &CrawlRequest<P>) -> Self {
+        let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
+
+        Self {
+            seed_group_id: request.seed_group_id,
+            seed_url: request.seed_url.clone(),
+            tags: request.tags.clone(),
+            normalized_url: identity.normalized,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CrawlRunState<P> {
     /// Candidate requests waiting to be visited.
     frontier: FrontierQueue<P>,
 
-    /// Normalized URLs currently queued.
+    /// Seed/tag-scoped fetch keys currently queued.
     ///
-    /// This prevents the same normalized URL from being enqueued many times
-    /// before it is popped and visited.
-    queued_fetch_keys: HashSet<NormalizedUrl>,
+    /// This prevents repeated enqueueing before an item is popped and marked
+    /// visited, while still allowing distinct caller associations to reach the
+    /// shared cache artifact.
+    queued_fetch_keys: HashSet<FetchVisitKey>,
 
-    /// Normalized URLs already popped and committed for crawl work.
+    /// Seed/tag-scoped fetch keys already committed for crawl work in this run.
+    visited_fetch_keys: HashSet<FetchVisitKey>,
+
+    /// Number of opened page results per seed.
+    opened_pages_by_seed: HashMap<SeedBudgetKey, usize>,
+
+    /// Number of reserved/in-flight page slots per seed.
+    inflight_pages_by_seed: HashMap<SeedBudgetKey, usize>,
+
+    /// Total opened page results for the whole invocation.
     ///
-    /// This prevents repeated browser/cache work for the same normalized URL
-    /// inside one crawl run.
-    visited_fetch_keys: HashSet<NormalizedUrl>,
+    /// This is only used for the optional global emergency brake.
+    total_opened_pages: usize,
 
     /// Results collected so far.
     pages: Vec<CrawlPageResult<P>>,
@@ -101,9 +191,9 @@ where
         let mut queued_fetch_keys = HashSet::new();
 
         for request in seeds {
-            let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
+            let fetch_key = FetchVisitKey::from_request(&request);
 
-            if queued_fetch_keys.insert(identity.normalized) {
+            if queued_fetch_keys.insert(fetch_key) {
                 frontier.push(FrontierItem::new(request));
             }
         }
@@ -112,63 +202,190 @@ where
             frontier,
             queued_fetch_keys,
             visited_fetch_keys: HashSet::new(),
+            opened_pages_by_seed: HashMap::new(),
+            inflight_pages_by_seed: HashMap::new(),
+            total_opened_pages: 0,
             pages: Vec::new(),
             limits,
         }
     }
 
+    /// Returns true while there is frontier work and the optional global
+    /// emergency brake has not fired.
+    ///
+    /// Per-seed budgets are checked when reserving work.
     pub fn should_continue(&self) -> bool {
-        self.pages.len() < self.limits.max_pages && !self.frontier.is_empty()
+        !self.global_page_budget_exhausted() && !self.frontier.is_empty()
     }
 
     pub fn pop_next(&mut self) -> Option<FrontierItem<P>> {
         self.frontier.pop()
     }
 
-    /// Return true if this normalized URL has already been visited/committed
-    /// for crawl work in the current run.
+    pub fn frontier_len(&self) -> usize {
+        self.frontier.len()
+    }
+
+    pub fn pages_len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn total_opened_pages(&self) -> usize {
+        self.total_opened_pages
+    }
+
+    pub fn global_page_budget_exhausted(&self) -> bool {
+        self.limits
+            .max_total_pages
+            .is_some_and(|max| self.total_opened_pages >= max)
+    }
+
+    pub fn seed_budget_key(request: &CrawlRequest<P>) -> SeedBudgetKey {
+        SeedBudgetKey::from_request(request)
+    }
+
+    pub fn opened_pages_for_seed(&self, request: &CrawlRequest<P>) -> usize {
+        let key = Self::seed_budget_key(request);
+
+        self.opened_pages_by_seed
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn inflight_pages_for_seed(&self, request: &CrawlRequest<P>) -> usize {
+        let key = Self::seed_budget_key(request);
+
+        self.inflight_pages_by_seed
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Return true if this request's seed still has page budget available.
+    ///
+    /// This checks opened + in-flight slots. That makes it safe for concurrent
+    /// dispatch.
+    pub fn can_reserve_seed_slot(&self, request: &CrawlRequest<P>) -> bool {
+        if self.global_page_budget_exhausted() {
+            return false;
+        }
+
+        let opened = self.opened_pages_for_seed(request);
+        let inflight = self.inflight_pages_for_seed(request);
+
+        opened + inflight < self.limits.max_pages_per_seed
+    }
+
+    /// Reserve one in-flight page slot for this request's seed.
+    ///
+    /// Returns false if the seed or global budget is exhausted.
+    pub fn reserve_seed_slot(&mut self, request: &CrawlRequest<P>) -> bool {
+        if !self.can_reserve_seed_slot(request) {
+            return false;
+        }
+
+        let key = Self::seed_budget_key(request);
+
+        *self.inflight_pages_by_seed.entry(key).or_insert(0) += 1;
+
+        true
+    }
+
+    /// Release one reserved/in-flight page slot for this request's seed.
+    ///
+    /// Call this when a reserved job completes, regardless of whether it opened,
+    /// failed, or skipped.
+    pub fn release_seed_slot(&mut self, request: &CrawlRequest<P>) {
+        let key = Self::seed_budget_key(request);
+
+        let should_remove = match self.inflight_pages_by_seed.get_mut(&key) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+
+            None => false,
+        };
+
+        if should_remove {
+            self.inflight_pages_by_seed.remove(&key);
+        }
+    }
+
+    fn commit_opened_page_for_seed(&mut self, request: &CrawlRequest<P>) {
+        let key = Self::seed_budget_key(request);
+
+        *self.opened_pages_by_seed.entry(key).or_insert(0) += 1;
+        self.total_opened_pages += 1;
+    }
+
+    /// Return true if this request has already been visited/committed for crawl
+    /// work in the current run.
+    ///
+    /// The key is seed/tag-scoped, so the same normalized URL may still be
+    /// processed for another caller association. That lets warm-cache requests
+    /// merge their tags onto the shared artifact.
     pub fn has_visited_fetch_key(&self, request: &CrawlRequest<P>) -> bool {
-        let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
-        self.visited_fetch_keys.contains(&identity.normalized)
+        let fetch_key = FetchVisitKey::from_request(request);
+
+        self.visited_fetch_keys.contains(&fetch_key)
     }
 
     pub fn mark_visited(&mut self, request: &CrawlRequest<P>) {
-        let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
-        self.visited_fetch_keys.insert(identity.normalized);
+        let fetch_key = FetchVisitKey::from_request(request);
+
+        self.visited_fetch_keys.insert(fetch_key);
     }
 
     /// Attempt to enqueue a request.
     ///
     /// Returns true when the request was actually added to the frontier.
-    /// Returns false when it was already queued, already visited, or rejected
-    /// because the frontier is full.
     pub fn enqueue_request(&mut self, request: CrawlRequest<P>) -> bool {
-        let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
-        let normalized = identity.normalized;
-
-        if self.visited_fetch_keys.contains(&normalized) {
+        if self.global_page_budget_exhausted() {
             return false;
         }
 
-        if !self.queued_fetch_keys.insert(normalized.clone()) {
+        // Early budget backpressure. The final gate is still reservation time.
+        if !self.can_reserve_seed_slot(&request) {
+            return false;
+        }
+
+        let fetch_key = FetchVisitKey::from_request(&request);
+
+        if self.visited_fetch_keys.contains(&fetch_key) {
+            return false;
+        }
+
+        if !self.queued_fetch_keys.insert(fetch_key.clone()) {
             return false;
         }
 
         if self.frontier.push(FrontierItem::new(request)) {
             true
         } else {
-            // Roll back the queued marker if the frontier refused the item.
-            self.queued_fetch_keys.remove(&normalized);
+            self.queued_fetch_keys.remove(&fetch_key);
             false
         }
     }
 
+    /// Record a completed page result.
+    ///
+    /// Only `Opened` results consume page budgets.
     pub fn record_page(&mut self, result: CrawlPageResult<P>) {
+        if matches!(result.outcome, CrawlPageOutcome::Opened { .. }) {
+            self.commit_opened_page_for_seed(&result.request);
+        }
+
         self.pages.push(result);
     }
 
-    pub fn pages_len(&self) -> usize {
-        self.pages.len()
+    /// Complete a previously reserved page job and record its result.
+    ///
+    /// This is the method the concurrent coordinator should use.
+    pub fn complete_reserved_page(&mut self, result: CrawlPageResult<P>) {
+        self.release_seed_slot(&result.request);
+        self.record_page(result);
     }
 
     pub fn finish(self) -> CrawlRunResult<P> {
@@ -183,9 +400,8 @@ where
     /// - only expands if still under `max_hop_depth`,
     /// - respects scope policy,
     /// - avoids URLs already queued or visited in this run,
-    /// - preserves seed/request context through `CrawlRequest::discovered_from`,
-    /// - sets `discovered_from` to the parent's requested URL,
-    /// - increments hop depth by one.
+    /// - preserves seed/request context via `CrawlRequest::discovered_from`,
+    /// - avoids adding work for seeds whose page budget is already consumed.
     pub fn expand_from_anchors(
         &mut self,
         parent: &CrawlRequest<P>,
@@ -195,6 +411,14 @@ where
         let next_depth = parent.hop_depth + 1;
 
         if next_depth > self.limits.max_hop_depth {
+            return;
+        }
+
+        if self.global_page_budget_exhausted() {
+            return;
+        }
+
+        if !self.can_reserve_seed_slot(parent) {
             return;
         }
 
@@ -223,6 +447,12 @@ where
                     )
                     .cyan()
                 );
+            }
+
+            // Avoid flooding the frontier for a seed that no longer has
+            // theoretical capacity.
+            if !self.can_reserve_seed_slot(parent) {
+                break;
             }
         }
     }

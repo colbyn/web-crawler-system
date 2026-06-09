@@ -3,7 +3,10 @@
 //! Provides commands to crawl content into a shared SQLite cache and inspect
 //! cached artifacts.
 
-use clap::{Parser, Subcommand};
+use clap::{
+    Parser,
+    Subcommand,
+};
 use std::path::PathBuf;
 
 mod commands;
@@ -47,16 +50,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::warn!(
-        "HELLO WORLD"
-    );
-
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Crawl(args) => {
             commands::crawl::run(args, &cli.profile_root, &cli.cache_db).await?;
         }
+
         Commands::Cache { action } => {
             commands::cache::run(action, &cli.cache_db).await?;
         }
@@ -64,3 +64,4 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+

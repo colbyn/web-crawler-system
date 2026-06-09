@@ -30,6 +30,7 @@ use crate::{
     BrowserSession, BrowserSessionHealth, HeadlessMode,
 };
 
+#[derive(Clone)]
 pub struct BrowserDriver {
     config: BrowserDriverConfig,
 }

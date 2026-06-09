@@ -10,10 +10,50 @@
 //! profile keys directly, or the scheduler may derive them from generic URL or
 //! seed-group facts.
 //!
-//! The key design pressure is cache/profile consistency. Browser cache,
-//! cookies, service workers, and local storage are profile-scoped. If the engine
-//! wants persistent browser caching to help future recrawls, profile assignment
-//! must be deterministic.
+//! ## Browser profile semantics
+//!
+//! Browser profiles are execution state. They control things like:
+//!
+//! - browser HTTP cache,
+//! - cookies,
+//! - service workers,
+//! - local storage,
+//! - consent/login/session state,
+//! - profile-specific browser warmup.
+//!
+//! Persistent browser profiles can make repeated live crawls faster or more
+//! realistic, especially when the same host is consistently assigned to the same
+//! profile.
+//!
+//! ## Important cache boundary
+//!
+//! Browser profile keys are **not** SQLite artifact cache identity.
+//!
+//! A profile key answers:
+//!
+//! ```text
+//! Which browser state should execute this request?
+//! ```
+//!
+//! It does not answer:
+//!
+//! ```text
+//! Is this the same reusable page artifact?
+//! ```
+//!
+//! The SQLite cache should use stable request identity such as requested URL,
+//! namespace, and cache key version. The browser profile used to produce an
+//! artifact belongs in cache metadata as provenance.
+//!
+//! If the observable page genuinely varies by crawl context, callers should use
+//! an explicit semantic namespace or future vary dimension. Do not use raw
+//! Chrome profile IDs as artifact identity.
+//!
+//! ## Determinism
+//!
+//! Profile assignment should still be deterministic. Even though profile keys do
+//! not define SQLite cache identity, deterministic assignment improves browser
+//! cache reuse and makes crawl behavior easier to inspect.
 
 use serde::{
     Deserialize,
@@ -29,20 +69,27 @@ use crate::input::CrawlRequest;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserProfileStrategy {
-    /// Every request uses the same profile key.
+    /// Every request uses the same browser profile key.
     Single {
         key: BrowserProfileKey,
     },
 
-    /// Use caller-provided profile key when present, otherwise fallback.
+    /// Use caller-provided browser profile key when present, otherwise fallback.
     CallerProvidedOrSingle {
         fallback: BrowserProfileKey,
     },
 
-    /// Derive a profile key from the requested URL host.
+    /// Derive a browser profile key from the requested URL host.
+    ///
+    /// This can improve browser-cache locality for live crawls, but it should
+    /// not affect SQLite artifact cache identity.
     ByHost,
 
-    /// Derive a profile key from the seed URL host.
+    /// Derive a browser profile key from the original seed URL host.
+    ///
+    /// This keeps all discovered pages from a seed in the same browser profile.
+    /// That may be useful for cookies, service workers, and browser cache
+    /// locality. It should not affect SQLite artifact cache identity.
     BySeedHost,
 }
 
@@ -57,6 +104,9 @@ impl Default for BrowserProfileStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BrowserProfileAssignment {
+    /// Browser profile key assigned for live execution.
+    ///
+    /// This is execution provenance, not SQLite cache identity.
     pub key: BrowserProfileKey,
 }
 
@@ -77,12 +127,10 @@ impl SessionScheduler {
         let key = match &self.strategy {
             BrowserProfileStrategy::Single { key } => key.clone(),
 
-            BrowserProfileStrategy::CallerProvidedOrSingle { fallback } => {
-                request
-                    .profile_key
-                    .clone()
-                    .unwrap_or_else(|| fallback.clone())
-            }
+            BrowserProfileStrategy::CallerProvidedOrSingle { fallback } => request
+                .profile_key
+                .clone()
+                .unwrap_or_else(|| fallback.clone()),
 
             BrowserProfileStrategy::ByHost => {
                 let host = request
@@ -94,7 +142,10 @@ impl SessionScheduler {
             }
 
             BrowserProfileStrategy::BySeedHost => {
-                let host = request.seed_url.host_str().unwrap_or("unknown-seed-host");
+                let host = request
+                    .seed_url
+                    .host_str()
+                    .unwrap_or("unknown-seed-host");
 
                 BrowserProfileKey::new(format!("seed-host:{host}"))
             }

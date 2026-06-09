@@ -14,12 +14,25 @@
 //! ## Cache identity
 //!
 //! Cache identity is defined by [`CacheKey`] and stored as a stable digest.
-//! The key is request-addressed: requested URL, browser profile key, namespace,
-//! and key/schema versions.
+//! The key is request-addressed:
 //!
-//! Runtime facts such as final URL, redirects, status code, telemetry, and
-//! extracted page data are stored in metadata, not used as the primary lookup
-//! identity.
+//! - requested URL,
+//! - optional namespace,
+//! - key/schema versions.
+//!
+//! Runtime facts such as final URL, redirects, status code, telemetry, extracted
+//! page data, and browser/driver profile identity are stored in metadata, not
+//! used as primary lookup identity.
+//!
+//! This distinction matters. Browser profiles are execution/provenance details.
+//! If the cache key includes a Chrome profile or worker bucket, the same URL
+//! crawled by two different profiles becomes two different cache entries. That
+//! fragments the shared performance cache and turns scheduler implementation
+//! details into durable storage identity.
+//!
+//! If page content genuinely varies by crawl context, represent that
+//! deliberately through namespace or a future semantic vary dimension. Do not
+//! use raw driver profile IDs as artifact identity.
 //!
 //! ## Tags
 //!
@@ -60,18 +73,18 @@
 
 use std::path::Path;
 
-use sqlx::{
-    Row,
-    Sqlite,
-    SqlitePool,
-    Transaction,
-};
 use sqlx::sqlite::{
     SqliteConnectOptions,
     SqliteJournalMode,
     SqlitePoolOptions,
     SqliteRow,
     SqliteSynchronous,
+};
+use sqlx::{
+    Row,
+    Sqlite,
+    SqlitePool,
+    Transaction,
 };
 
 use crate::sqlite_cache::{
@@ -158,7 +171,15 @@ impl SqliteCache {
                 final_url           TEXT,
                 final_host          TEXT,
                 namespace           TEXT,
+
+                -- Browser/driver profile provenance.
+                --
+                -- This is metadata only. It is intentionally not part of
+                -- CacheKey/key_digest. Keeping the column name avoids migration
+                -- churn while the stored meaning remains "profile that produced
+                -- this artifact", not "profile that identifies this artifact".
                 profile_key_json    TEXT NOT NULL,
+
                 stored_at_unix_ms   INTEGER NOT NULL,
                 status_code         INTEGER,
                 content_type        TEXT,
@@ -339,8 +360,14 @@ impl SqliteCache {
         let metadata_json = serde_json::to_string_pretty(&entry.metadata)
             .map_err(|e| CacheError::Json(e.to_string()))?;
 
-        let profile_key_json = serde_json::to_string_pretty(&key.profile_key)
-            .map_err(|e| CacheError::Json(e.to_string()))?;
+        // Browser profile provenance is request metadata, not cache identity.
+        //
+        // The database column is retained for inspectability and compatibility,
+        // but the value comes from `CacheRequestInfo`, not `CacheKey`.
+        let profile_key_json = serde_json::to_string_pretty(
+            &entry.metadata.request.profile_key_json,
+        )
+        .map_err(|e| CacheError::Json(e.to_string()))?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1008,4 +1035,3 @@ fn rows_to_entry_refs(rows: Vec<SqliteRow>) -> CacheResult<Vec<CacheEntryRef>> {
 
     Ok(refs)
 }
-

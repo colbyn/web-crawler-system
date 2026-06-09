@@ -2514,6 +2514,7 @@ dependencies = [
  "bincode",
  "colored",
  "colored_json",
+ "futures",
  "hex",
  "indexmap",
  "serde",
