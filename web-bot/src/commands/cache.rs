@@ -24,8 +24,6 @@
 use clap::Subcommand;
 use sqlx::Row;
 use std::path::PathBuf;
-
-use web_browser_driver::BrowserProfileKey;
 use web_crawler_engine_v3::sqlite_cache::{
     cache_key_digest,
     CacheEntry,
