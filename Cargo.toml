@@ -7,3 +7,8 @@ git = "https://github.com/mattsse/chromiumoxide"
 branch = "main"
 # features = ["tokio", "tokio-runtime"]
 # default-features = false
+
+[workspace.dependencies.sqlx]
+version = "0.8"
+features = ["runtime-tokio", "sqlite", "migrate"]
+

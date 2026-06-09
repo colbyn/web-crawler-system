@@ -1,6 +1,6 @@
 //! web-bot — Operational CLI for the web crawler system.
 //!
-//! Provides commands to crawl content into a shared cache and inspect
+//! Provides commands to crawl content into a shared SQLite cache and inspect
 //! cached artifacts.
 
 use clap::{Parser, Subcommand};
@@ -13,19 +13,19 @@ mod commands;
     name = "web-bot",
     version,
     about = "Web crawler operations tool",
-    long_about = "A CLI for preemptively crawling content and inspecting the shared cache."
+    long_about = "A CLI for preemptively crawling content and inspecting the shared SQLite cache."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
     /// Directory where browser profiles are stored
-    #[arg(long, default_value = "./profiles")]
+    #[arg(long, default_value = "./output/web-bot/profiles")]
     profile_root: PathBuf,
 
-    /// Directory where cached page artifacts are stored
-    #[arg(long, default_value = "./cache")]
-    cache_root: PathBuf,
+    /// SQLite cache database path
+    #[arg(long, default_value = "./output/web-bot/cache.sqlite")]
+    cache_db: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -42,7 +42,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing (respects RUST_LOG)
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -51,10 +50,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Crawl(args) => {
-            commands::crawl::run(args, &cli.profile_root, &cli.cache_root).await?;
+            commands::crawl::run(args, &cli.profile_root, &cli.cache_db).await?;
         }
         Commands::Cache { action } => {
-            commands::cache::run(action, &cli.cache_root).await?;
+            commands::cache::run(action, &cli.cache_db).await?;
         }
     }
 

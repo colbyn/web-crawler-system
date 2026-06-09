@@ -44,6 +44,6 @@ pub use model::{
     CachePayloadDescriptor, CachePayloadRole, CacheProducerInfo, CacheRequestInfo,
     CacheResponseInfo, CACHE_ENTRY_KIND_PAGE, CACHE_METADATA_VERSION,
 };
-pub use tags::{normalize_tag, CacheTag};
+pub use tags::CacheTag;
 pub use time::now_unix_ms;
 

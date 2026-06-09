@@ -1,3 +1,7 @@
+# TODO
+
+Possibly out of date. See CLI definitions for current API.
+
 # web-bot
 
 **Operational CLI for the web crawler system.**

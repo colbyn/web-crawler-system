@@ -17,3 +17,5 @@ colored_json = "5.0.0"
 
 web-crawler-engine-v3 = { path = "../web-crawler-engine-v3" }
 web-browser-driver = { path = "../web-browser-driver" }
+
+sqlx = { workspace = true}

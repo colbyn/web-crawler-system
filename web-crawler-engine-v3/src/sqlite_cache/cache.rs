@@ -50,8 +50,12 @@ impl SqliteCache {
     /// This will create the database file if it doesn't exist and run
     /// all necessary migrations.
     pub async fn open(path: impl AsRef<Path>) -> CacheResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         let options = SqliteConnectOptions::new()
-            .filename(path.as_ref())
+            .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)

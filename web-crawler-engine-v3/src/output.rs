@@ -34,11 +34,9 @@ use web_browser_driver::{
 };
 
 use crate::{
-    cache::{
-        CacheDecision,
-        CacheKey,
-    },
     input::CrawlRequest,
+    policy::CacheDecision,
+    sqlite_cache::CacheKey,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

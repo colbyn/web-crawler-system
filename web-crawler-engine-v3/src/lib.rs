@@ -55,7 +55,7 @@
 //!
 //! See the module-level docs in the original design for the full philosophy.
 
-pub mod cache; // TODO: WILL DELETE
+// pub mod cache; // DISABLED — TODO: REMOVE DELETE FOLDER
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -70,11 +70,11 @@ pub mod store;
 pub mod url;
 pub mod sqlite_cache;
 
-pub use cache::{
-    CacheDecision, CacheKey, CachePolicy, CacheProducerInfo, CacheRejectionReason, CacheSnapshot,
-    CachedExtractedFacts, CachedPageArtifact, CrawlCacheError, CrawlCacheStore, FsCrawlCacheStore,
-    SnapshotCompression,
-};
+// pub use cache::{
+//     CacheDecision, CacheKey, CachePolicy, CacheProducerInfo, CacheRejectionReason, CacheSnapshot,
+//     CachedExtractedFacts, CachedPageArtifact, CrawlCacheError, CrawlCacheStore, FsCrawlCacheStore,
+//     SnapshotCompression,
+// };
 
 pub use config::{CrawlEngineConfig, CrawlLimits};
 
@@ -89,7 +89,8 @@ pub use input::{CrawlRequest, CrawlRequestId, CrawlSeed, SeedGroup, SeedGroupId}
 pub use output::{CrawlPageOutcome, CrawlPageResult, CrawlRunResult, SnapshotDecision};
 
 pub use policy::{
-    CrawlPolicy, ScopeDecision, ScopePolicy, SnapshotPolicy, VisitDecision, VisitPolicy,
+    CacheDecision, CachePolicy, CrawlPolicy, ScopeDecision, ScopePolicy, SnapshotPolicy,
+    VisitDecision, VisitPolicy,
 };
 
 pub use scheduler::{BrowserProfileAssignment, BrowserProfileStrategy, SessionScheduler};
@@ -102,3 +103,4 @@ pub use store::{CrawlArtifactSink, NoopCrawlArtifactSink};
 
 pub use url::{NormalizedUrl, UrlIdentity, UrlNormalizer};
 
+pub use sqlite_cache::SqliteCache;

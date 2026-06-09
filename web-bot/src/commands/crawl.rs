@@ -1,19 +1,19 @@
 //! Crawl command implementation.
 
 use clap::Args;
+use serde_json::Value;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use serde_json::Value;
 use url::Url;
+use web_browser_driver::BrowserDriver;
 use web_crawler_engine_v3::{
-    cache::FsCrawlCacheStore,
     config::{CrawlEngineConfig, CrawlLimits},
     input::CrawlRequest,
     policy::CrawlPolicy,
     scheduler::BrowserProfileStrategy,
     CrawlEngine,
+    SqliteCache,
 };
-use web_browser_driver::BrowserDriver;
 
 #[derive(Args, Debug)]
 pub struct CrawlArgs {
@@ -42,9 +42,12 @@ pub struct CrawlArgs {
 
     #[arg(long, default_value_t = 1)]
     pub max_depth: u32,
+
+    /// Disable cache lookup/storage for this crawl
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
-/// Collect input lines from `-i` flags and/or stdin
 fn collect_input_lines(args: &CrawlArgs) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut read_stdin = false;
@@ -77,13 +80,12 @@ fn collect_input_lines(args: &CrawlArgs) -> anyhow::Result<Vec<String>> {
 pub async fn run(
     args: CrawlArgs,
     profile_root: &PathBuf,
-    cache_root: &PathBuf,
+    cache_db: &PathBuf,
 ) -> anyhow::Result<()> {
     let raw_lines = collect_input_lines(&args)?;
 
     if raw_lines.is_empty() {
         if args.json {
-            // Emit empty array for machine consumers
             println!("[]");
         } else {
             eprintln!("No URLs provided.");
@@ -91,7 +93,6 @@ pub async fn run(
         return Ok(());
     }
 
-    // === Parse input ===
     let mut parsed = Vec::new();
 
     for line in raw_lines {
@@ -103,6 +104,7 @@ pub async fn run(
                     eprintln!("Skipping invalid URL: {}", line);
                 }
             }
+
             "ndjson" | "json" => {
                 let json: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
@@ -131,12 +133,17 @@ pub async fn run(
                 };
 
                 if let Ok(url) = Url::parse(&url_str) {
-                    let provenance = if args.attach_provenance { Some(json) } else { None };
+                    let provenance = if args.attach_provenance {
+                        Some(json)
+                    } else {
+                        None
+                    };
                     parsed.push((url, provenance));
                 } else {
                     eprintln!("Invalid URL extracted: {}", url_str);
                 }
             }
+
             other => anyhow::bail!("Unsupported format: {}", other),
         }
     }
@@ -148,8 +155,12 @@ pub async fn run(
 
     eprintln!("Crawling {} URLs...", parsed.len());
 
-    // === Engine Setup ===
-    let cache_store = FsCrawlCacheStore::new(cache_root);
+    let sqlite_cache = if args.no_cache {
+        None
+    } else {
+        Some(SqliteCache::open(cache_db).await?)
+    };
+
     let driver = BrowserDriver::new(Default::default());
 
     let config = CrawlEngineConfig {
@@ -159,7 +170,7 @@ pub async fn run(
             max_frontier_items: 10_000,
         },
         page_open_timeout: std::time::Duration::from_secs(45),
-        cache_enabled: true,
+        cache_enabled: !args.no_cache,
     };
 
     let policy = CrawlPolicy::default();
@@ -169,23 +180,21 @@ pub async fn run(
         config,
         policy,
         driver,
-        Some(cache_store),
+        sqlite_cache,
         profile_root.clone(),
         profile_strategy,
     );
 
-    let mut requests = Vec::new();
-    for (url, provenance) in parsed {
-        let prov = provenance.unwrap_or_else(|| serde_json::json!({}));
-        requests.push(CrawlRequest::seed(url, prov));
-    }
+    let requests = parsed
+        .into_iter()
+        .map(|(url, provenance)| {
+            CrawlRequest::seed(url, provenance.unwrap_or_else(|| serde_json::json!({})))
+        })
+        .collect();
 
-    // === Run Crawl ===
     let result = engine.crawl(requests).await?;
 
-    // === Output ===
     if args.json {
-        // Structured output to STDOUT (NDJSON)
         let stdout = io::stdout();
         let mut handle = stdout.lock();
 
@@ -195,7 +204,6 @@ pub async fn run(
             }
         }
     } else {
-        // Human-readable summary to STDERR
         let mut success = 0;
         let mut failed = 0;
         let mut from_cache = 0;
@@ -204,11 +212,19 @@ pub async fn run(
             match &page.outcome {
                 web_crawler_engine_v3::output::CrawlPageOutcome::Opened { .. } => {
                     success += 1;
-                    if matches!(page.cache_decision, Some(web_crawler_engine_v3::CacheDecision::Use)) {
+
+                    if matches!(
+                        page.cache_decision,
+                        Some(web_crawler_engine_v3::CacheDecision::Use)
+                    ) {
                         from_cache += 1;
                     }
                 }
-                web_crawler_engine_v3::output::CrawlPageOutcome::Failed { .. } => failed += 1,
+
+                web_crawler_engine_v3::output::CrawlPageOutcome::Failed { .. } => {
+                    failed += 1;
+                }
+
                 _ => {}
             }
         }
@@ -221,3 +237,4 @@ pub async fn run(
 
     Ok(())
 }
+

@@ -1,19 +1,37 @@
 //! Cache inspection and management commands.
 
 use clap::Subcommand;
+use sqlx::Row;
 use std::path::PathBuf;
 
-use web_crawler_engine_v3::cache::{CacheKey, CrawlCacheStore, FsCrawlCacheStore};
+use web_browser_driver::BrowserProfileKey;
+use web_crawler_engine_v3::SqliteCache;
+use web_crawler_engine_v3::sqlite_cache::cache_key_digest;
+use web_crawler_engine_v3::sqlite_cache::CacheEntry;
+use web_crawler_engine_v3::sqlite_cache::CacheKey;
+use web_crawler_engine_v3::sqlite_cache::CachePayloadCompression;
+use web_crawler_engine_v3::sqlite_cache::CachePayloadRole;
+use web_crawler_engine_v3::sqlite_cache::CacheTag;
+use web_crawler_engine_v3::sqlite_cache::CachePayload;
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCommands {
     /// Show metadata for a cached URL
     Lookup {
         url: String,
+
+        /// Browser profile key used to address the cache entry
+        #[arg(long, default_value = "default")]
+        profile_key: String,
+
+        /// Optional cache namespace
+        #[arg(long)]
+        namespace: Option<String>,
+
         #[arg(long)]
         json: bool,
 
-        /// Print the full artifact (including HTML body and anchors)
+        /// Print payload bodies when possible
         #[arg(long)]
         full: bool,
     },
@@ -21,6 +39,15 @@ pub enum CacheCommands {
     /// Print or save the HTML snapshot
     Snapshot {
         url: String,
+
+        /// Browser profile key used to address the cache entry
+        #[arg(long, default_value = "default")]
+        profile_key: String,
+
+        /// Optional cache namespace
+        #[arg(long)]
+        namespace: Option<String>,
+
         /// Write to file instead of stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -29,11 +56,20 @@ pub enum CacheCommands {
     /// Remove a URL from the cache
     Remove {
         url: String,
+
+        /// Browser profile key used to address the cache entry
+        #[arg(long, default_value = "default")]
+        profile_key: String,
+
+        /// Optional cache namespace
+        #[arg(long)]
+        namespace: Option<String>,
+
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Clear the entire cache
+    /// Clear the entire cache database
     Clear {
         #[arg(short, long)]
         force: bool,
@@ -45,91 +81,203 @@ pub enum CacheCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Add tags to one cached URL
+    Tag {
+        url: String,
+
+        #[arg(long, default_value = "default")]
+        profile_key: String,
+
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Tags to add
+        tags: Vec<String>,
+    },
+
+    /// List entries by tag
+    ListByTag {
+        tag: String,
+
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-pub async fn run(action: CacheCommands, cache_root: &PathBuf) -> anyhow::Result<()> {
-    let store = FsCrawlCacheStore::new(cache_root);
+pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()> {
+    let cache = SqliteCache::open(cache_db).await?;
 
     match action {
-        CacheCommands::Lookup { url, json, full } => {
-            lookup_metadata(&store, &url, json, full).await?;
+        CacheCommands::Lookup {
+            url,
+            profile_key,
+            namespace,
+            json,
+            full,
+        } => {
+            lookup_metadata(&cache, &url, &profile_key, namespace, json, full).await?;
         }
 
-        CacheCommands::Snapshot { url, output } => {
-            get_snapshot(&store, &url, output).await?;
+        CacheCommands::Snapshot {
+            url,
+            profile_key,
+            namespace,
+            output,
+        } => {
+            get_snapshot(&cache, &url, &profile_key, namespace, output).await?;
         }
 
-        CacheCommands::Remove { url, force } => {
-            remove_url(&store, &url, force).await?;
+        CacheCommands::Remove {
+            url,
+            profile_key,
+            namespace,
+            force,
+        } => {
+            remove_url(&cache, &url, &profile_key, namespace, force).await?;
         }
 
         CacheCommands::Clear { force } => {
-            clear_cache(cache_root, force).await?;
+            clear_cache(&cache, cache_db, force).await?;
         }
 
         CacheCommands::Stats { json } => {
-            show_stats(cache_root, json).await?;
+            show_stats(&cache, cache_db, json).await?;
+        }
+
+        CacheCommands::Tag {
+            url,
+            profile_key,
+            namespace,
+            tags,
+        } => {
+            tag_url(&cache, &url, &profile_key, namespace, tags).await?;
+        }
+
+        CacheCommands::ListByTag { tag, json } => {
+            list_by_tag(&cache, &tag, json).await?;
         }
     }
 
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+fn key_for_url(
+    url: &str,
+    profile_key: &str,
+    namespace: Option<String>,
+) -> anyhow::Result<CacheKey> {
+    Ok(CacheKey::for_request(
+        url::Url::parse(url)?,
+        BrowserProfileKey::new(profile_key),
+        namespace,
+    ))
+}
+
+fn primary_payload(entry: &CacheEntry) -> Option<&CachePayload> {
+    entry
+        .payloads
+        .iter()
+        .find(|payload| payload.descriptor.role == CachePayloadRole::PrimarySnapshot)
+        .or_else(|| {
+            entry
+                .payloads
+                .iter()
+                .find(|payload| payload.descriptor.role == CachePayloadRole::ResponseBody)
+        })
+}
 
 async fn lookup_metadata(
-    store: &FsCrawlCacheStore,
+    cache: &SqliteCache,
     url: &str,
+    profile_key: &str,
+    namespace: Option<String>,
     json: bool,
-    full: bool,           // NEW: whether to print full artifact
+    full: bool,
 ) -> anyhow::Result<()> {
-    let profile_key = web_browser_driver::BrowserProfileKey::new("default");
-    let cache_key = CacheKey::for_request(
-        url::Url::parse(url)?,
-        profile_key,
-        None,
-    );
+    let cache_key = key_for_url(url, profile_key, namespace)?;
 
-    match store.load(&cache_key).await {
-        Ok(Some(artifact)) => {
+    match cache.get(&cache_key).await {
+        Some(entry) => {
+            let payload_summary = entry
+                .payloads
+                .iter()
+                .map(|payload| {
+                    serde_json::json!({
+                        "descriptor": payload.descriptor,
+                        "body": if full && payload.descriptor.compression == CachePayloadCompression::None {
+                            Some(String::from_utf8_lossy(&payload.body).to_string())
+                        } else {
+                            None::<String>
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let value = serde_json::json!({
+                "metadata": entry.metadata,
+                "payloads": payload_summary,
+                "tags": entry.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            });
+
             if json {
-                if full {
-                    // Full artifact (can be large)
-                    if let Ok(json_str) = serde_json::to_string_pretty(&artifact) {
-                        println!("{}", json_str);
-                    }
-                } else {
-                    // Light metadata only (recommended default)
-                    let mut artifact = serde_json::to_value(&artifact).unwrap();
-                    if let Some(data) = artifact.pointer_mut("/snapshot/body") {
-                        *data = serde_json::Value::Null;
-                    }
-                    // println!("{}", serde_json::to_string_pretty(&artifact)?);
-                    println!("{}", colored_json::to_colored_json_auto(&artifact).unwrap());
-                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                // Human readable output (to stderr)
-                eprintln!("✅ Cache Hit: {}", url);
-                eprintln!("  Final URL:      {}", artifact.resolution.final_url);
-                eprintln!("  Snapshot size:  {} bytes", artifact.snapshot.body.len());
-                eprintln!("  Anchors:        {}", artifact.extracted.anchors.len());
+                eprintln!("✅ Cache hit: {}", url);
+                eprintln!("  Requested URL:  {}", entry.metadata.request.requested_url);
 
-                if let Some(page_info) = &artifact.extracted.page_info {
-                    if let Some(title) = &page_info.title {
-                        eprintln!("  Title:          {}", title);
-                    }
+                if let Some(final_url) = &entry.metadata.response.final_url {
+                    eprintln!("  Final URL:      {}", final_url);
+                }
+
+                eprintln!("  Stored at ms:   {}", entry.metadata.stored_at_unix_ms);
+                eprintln!("  Status:         {:?}", entry.metadata.response.status_code);
+                eprintln!("  Content type:   {:?}", entry.metadata.response.content_type);
+
+                if let Some(primary) = entry.metadata.primary_payload() {
+                    eprintln!("  Snapshot size:  {} bytes", primary.byte_len);
+                    eprintln!("  SHA-256:        {}", primary.sha256_hex);
+                }
+
+                let anchors_len = entry
+                    .metadata
+                    .extracted_json
+                    .get("anchors")
+                    .and_then(|v| v.as_array())
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+
+                eprintln!("  Anchors:        {}", anchors_len);
+
+                if let Some(title) = entry
+                    .metadata
+                    .extracted_json
+                    .pointer("/page_info/title")
+                    .and_then(|v| v.as_str())
+                {
+                    eprintln!("  Title:          {}", title);
+                }
+
+                if !entry.tags.is_empty() {
+                    eprintln!(
+                        "  Tags:           {}",
+                        entry
+                            .tags
+                            .iter()
+                            .map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
             }
         }
-        Ok(None) => {
+
+        None => {
             if json {
                 println!("null");
             } else {
                 eprintln!("❌ Not found in cache: {}", url);
             }
-        }
-        Err(e) => {
-            eprintln!("Error loading from cache: {}", e);
         }
     }
 
@@ -137,34 +285,33 @@ async fn lookup_metadata(
 }
 
 async fn get_snapshot(
-    store: &FsCrawlCacheStore,
+    cache: &SqliteCache,
     url: &str,
+    profile_key: &str,
+    namespace: Option<String>,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let profile_key = web_browser_driver::BrowserProfileKey::new("default");
-    let cache_key = CacheKey::for_request(
-        url::Url::parse(url)?,
-        profile_key,
-        None,
-    );
+    let cache_key = key_for_url(url, profile_key, namespace)?;
 
-    let artifact = match store.load(&cache_key).await? {
-        Some(a) => a,
-        None => anyhow::bail!("URL not found in cache: {}", url),
-    };
+    let entry = cache
+        .get(&cache_key)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("URL not found in cache: {}", url))?;
 
-    let html = match artifact.snapshot.compression {
-        web_crawler_engine_v3::cache::SnapshotCompression::None => {
-            String::from_utf8_lossy(&artifact.snapshot.body).to_string()
-        }
-        other => anyhow::bail!("Unsupported compression: {:?}", other),
-    };
+    let payload = primary_payload(&entry)
+        .ok_or_else(|| anyhow::anyhow!("cache entry has no primary payload: {}", url))?;
+
+    match payload.descriptor.compression {
+        CachePayloadCompression::None => {}
+        other => anyhow::bail!("unsupported compression: {:?}", other),
+    }
+
+    let html = String::from_utf8_lossy(&payload.body).to_string();
 
     if let Some(path) = output {
         std::fs::write(&path, &html)?;
         eprintln!("Snapshot written to {}", path.display());
     } else {
-        // Actual data → stdout
         println!("{}", html);
     }
 
@@ -172,33 +319,35 @@ async fn get_snapshot(
 }
 
 async fn remove_url(
-    store: &FsCrawlCacheStore,
+    cache: &SqliteCache,
     url: &str,
+    profile_key: &str,
+    namespace: Option<String>,
     force: bool,
 ) -> anyhow::Result<()> {
     if !force {
         eprint!("Remove {} from cache? [y/N]: ", url);
         use std::io::{self, Write};
         io::stdout().flush()?;
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+
         if !input.trim().eq_ignore_ascii_case("y") {
             eprintln!("Aborted.");
             return Ok(());
         }
     }
 
-    let profile_key = web_browser_driver::BrowserProfileKey::new("default");
-    let cache_key = CacheKey::for_request(
-        url::Url::parse(url)?,
-        profile_key,
-        None,
-    );
+    let cache_key = key_for_url(url, profile_key, namespace)?;
+    let key_digest = cache_key_digest(&cache_key)?;
 
-    let path = store.path_for_key(&cache_key)?;
+    let result = sqlx::query("DELETE FROM cache_entries WHERE key_digest = ?")
+        .bind(&key_digest)
+        .execute(cache.pool())
+        .await?;
 
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    if result.rows_affected() > 0 {
         eprintln!("✅ Removed from cache: {}", url);
     } else {
         eprintln!("Not found in cache.");
@@ -207,72 +356,150 @@ async fn remove_url(
     Ok(())
 }
 
-async fn clear_cache(cache_root: &PathBuf, force: bool) -> anyhow::Result<()> {
+async fn clear_cache(
+    cache: &SqliteCache,
+    cache_db: &PathBuf,
+    force: bool,
+) -> anyhow::Result<()> {
     if !force {
-        eprintln!("This will delete ALL data in: {}", cache_root.display());
+        eprintln!("This will delete ALL cache rows in: {}", cache_db.display());
         eprint!("Are you sure? [y/N]: ");
         use std::io::{self, Write};
         io::stdout().flush()?;
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+
         if !input.trim().eq_ignore_ascii_case("y") {
             eprintln!("Aborted.");
             return Ok(());
         }
     }
 
-    let pages_dir = cache_root.join("pages");
-    if pages_dir.exists() {
-        std::fs::remove_dir_all(&pages_dir)?;
-    }
+    let mut tx = cache.pool().begin().await?;
+
+    sqlx::query("DELETE FROM cache_auxiliary")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cache_entry_tags")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cache_tags")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cache_payloads")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cache_entries")
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
 
     eprintln!("✅ Cache cleared.");
     Ok(())
 }
 
-async fn show_stats(cache_root: &PathBuf, json: bool) -> anyhow::Result<()> {
-    let pages_dir = cache_root.join("pages");
+async fn show_stats(
+    cache: &SqliteCache,
+    cache_db: &PathBuf,
+    json: bool,
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM cache_entries) AS total_entries,
+            (SELECT COUNT(*) FROM cache_payloads) AS total_payloads,
+            (SELECT COALESCE(SUM(byte_len), 0) FROM cache_payloads) AS total_payload_bytes,
+            (SELECT COUNT(*) FROM cache_tags) AS total_tags,
+            (SELECT COUNT(*) FROM cache_entry_tags) AS total_tag_links
+        "#,
+    )
+    .fetch_one(cache.pool())
+    .await?;
 
-    if !pages_dir.exists() {
-        if json {
-            println!(r#"{{"total_pages": 0, "total_size_bytes": 0}}"#);
-        } else {
-            eprintln!("No cached data found.");
-        }
-        return Ok(());
-    }
-
-    let mut total_files = 0usize;
-    let mut total_size: u64 = 0;
-
-    for entry in walkdir::WalkDir::new(&pages_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            total_files += 1;
-            if let Ok(m) = entry.metadata() {
-                total_size += m.len();
-            }
-        }
-    }
+    let total_entries: i64 = row.try_get("total_entries")?;
+    let total_payloads: i64 = row.try_get("total_payloads")?;
+    let total_payload_bytes: i64 = row.try_get("total_payload_bytes")?;
+    let total_tags: i64 = row.try_get("total_tags")?;
+    let total_tag_links: i64 = row.try_get("total_tag_links")?;
 
     if json {
-        // Structured output → stdout
         println!(
-            r#"{{"total_pages": {}, "total_size_bytes": {}}}"#,
-            total_files, total_size
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "cache_db": cache_db,
+                "total_entries": total_entries,
+                "total_payloads": total_payloads,
+                "total_payload_bytes": total_payload_bytes,
+                "total_tags": total_tags,
+                "total_tag_links": total_tag_links,
+            }))?
         );
     } else {
-        // Human output → stderr
-        eprintln!("Cache root: {}", cache_root.display());
-        eprintln!("Total pages:  {}", total_files);
+        eprintln!("Cache DB:       {}", cache_db.display());
+        eprintln!("Entries:        {}", total_entries);
+        eprintln!("Payloads:       {}", total_payloads);
         eprintln!(
-            "Disk usage:   {} bytes ({:.2} MB)",
-            total_size,
-            total_size as f64 / 1_048_576.0
+            "Payload bytes:  {} ({:.2} MB)",
+            total_payload_bytes,
+            total_payload_bytes as f64 / 1_048_576.0
         );
+        eprintln!("Tags:           {}", total_tags);
+        eprintln!("Tag links:      {}", total_tag_links);
     }
 
     Ok(())
 }
+
+async fn tag_url(
+    cache: &SqliteCache,
+    url: &str,
+    profile_key: &str,
+    namespace: Option<String>,
+    tags: Vec<String>,
+) -> anyhow::Result<()> {
+    if tags.is_empty() {
+        anyhow::bail!("at least one tag is required");
+    }
+
+    let cache_key = key_for_url(url, profile_key, namespace)?;
+
+    if cache.get(&cache_key).await.is_none() {
+        anyhow::bail!("URL not found in cache: {}", url);
+    }
+
+    let tags = tags.into_iter().map(CacheTag::new).collect::<Vec<_>>();
+    cache.tag(&cache_key, &tags).await?;
+
+    eprintln!("✅ Tagged {} with {} tag(s).", url, tags.len());
+    Ok(())
+}
+
+async fn list_by_tag(
+    cache: &SqliteCache,
+    tag: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let tag = CacheTag::new(tag);
+    let refs = cache.list_by_tag(&tag).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&refs)?);
+    } else if refs.is_empty() {
+        eprintln!("No cache entries found for tag: {}", tag.as_str());
+    } else {
+        for entry in refs {
+            println!(
+                "{}\t{}\t{:?}\t{}",
+                entry.stored_at_unix_ms,
+                entry.requested_url,
+                entry.status_code,
+                entry.key_digest,
+            );
+        }
+    }
+
+    Ok(())
+}
+

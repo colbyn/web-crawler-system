@@ -14,8 +14,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sqlite_cache::CacheKey;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheTag {
@@ -39,7 +37,7 @@ impl CacheTag {
 }
 
 /// Normalize a raw tag into a clean, lowercase form suitable for storage and lookup.
-pub fn normalize_tag(raw: String) -> String {
+pub(crate) fn normalize_tag(raw: String) -> String {
     let normalized = raw
         .trim()
         .to_ascii_lowercase()

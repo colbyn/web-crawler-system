@@ -18,37 +18,52 @@ use web_browser_driver::{
     AnchorExtractor, BrowserDriver, OpenPageOptions, PageInfoExtractor,
 };
 
-use crate::{
-    cache::{CacheKey, CrawlCacheStore},
-    config::CrawlEngineConfig,
-    error::CrawlEngineResult,
-    input::CrawlRequest,
-    output::{CrawlPageOutcome, CrawlPageResult, CrawlRunResult, SnapshotDecision},
-    policy::{CrawlPolicy, VisitDecision},
-    scheduler::{BrowserProfileAssignment, BrowserProfileStrategy, SessionScheduler},
-    sessions::SessionPool,
-    state::CrawlRunState,
-    store::{CrawlArtifactSink, NoopCrawlArtifactSink},
-    CacheDecision,
+
+
+
+use crate::config::CrawlEngineConfig;
+use crate::error::CrawlEngineResult;
+use crate::input::CrawlRequest;
+use crate::output::{CrawlPageOutcome, CrawlPageResult, CrawlRunResult, SnapshotDecision};
+use crate::scheduler::{BrowserProfileAssignment, BrowserProfileStrategy, SessionScheduler};
+use crate::sessions::SessionPool;
+use crate::state::CrawlRunState;
+use crate::store::{CrawlArtifactSink, NoopCrawlArtifactSink};
+
+use crate::policy::{CacheDecision, CrawlPolicy, VisitDecision};
+use crate::sqlite_cache::{
+    CacheEntry, CacheEntryMetadata, CacheKey, CachePayload, CachePayloadCompression,
+    CachePayloadRole, SqliteCache,
 };
 
-pub struct CrawlEngine<P, C = crate::cache::FsCrawlCacheStore, S = NoopCrawlArtifactSink> {
+// ————————————————————————————————————————————————————————————————————————————
+// SMALL UTILS
+// ————————————————————————————————————————————————————————————————————————————
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub struct CrawlEngine<P, S = NoopCrawlArtifactSink> {
     pub config: CrawlEngineConfig,
     pub policy: CrawlPolicy,
     pub browser_driver: BrowserDriver,
-    pub cache_store: Option<C>,
+    pub sqlite_cache: Option<SqliteCache>,
     pub sink: S,
     pub profile_root: std::path::PathBuf,
     pub profile_strategy: BrowserProfileStrategy,
     _provenance: PhantomData<P>,
 }
 
-impl<P> CrawlEngine<P, crate::cache::FsCrawlCacheStore> {
+impl<P> CrawlEngine<P> {
     pub fn new(
         config: CrawlEngineConfig,
         policy: CrawlPolicy,
         browser_driver: BrowserDriver,
-        cache_store: Option<crate::cache::FsCrawlCacheStore>,
+        sqlite_cache: Option<SqliteCache>,
         profile_root: std::path::PathBuf,
         profile_strategy: BrowserProfileStrategy,
     ) -> Self {
@@ -56,7 +71,7 @@ impl<P> CrawlEngine<P, crate::cache::FsCrawlCacheStore> {
             config,
             policy,
             browser_driver,
-            cache_store,
+            sqlite_cache,
             sink: NoopCrawlArtifactSink,
             profile_root,
             profile_strategy,
@@ -65,18 +80,29 @@ impl<P> CrawlEngine<P, crate::cache::FsCrawlCacheStore> {
     }
 }
 
-impl<P, C, S> CrawlEngine<P, C, S>
+impl<P, S> CrawlEngine<P, S>
 where
     P: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
-    C: CrawlCacheStore + Send + Sync,
     S: CrawlArtifactSink<P> + Send + Sync,
 {
-    pub fn with_sink<S2>(self, sink: S2) -> CrawlEngine<P, C, S2> {
+    /// Attach a `SqliteCache`
+    pub fn with_sqlite_cache(mut self, cache: SqliteCache) -> Self {
+        self.sqlite_cache = Some(cache);
+        self
+    }
+
+    /// Remove any attached cache
+    pub fn without_cache(mut self) -> Self {
+        self.sqlite_cache = None;
+        self
+    }
+
+    pub fn with_sink<S2>(self, sink: S2) -> CrawlEngine<P, S2> {
         CrawlEngine {
             config: self.config,
             policy: self.policy,
             browser_driver: self.browser_driver,
-            cache_store: self.cache_store,
+            sqlite_cache: self.sqlite_cache,
             sink,
             profile_root: self.profile_root,
             profile_strategy: self.profile_strategy,
@@ -94,45 +120,95 @@ where
         if !self.config.cache_enabled {
             return Ok(None);
         }
-        let Some(store) = &self.cache_store else {
+
+        let Some(cache) = &self.sqlite_cache else {
             return Ok(None);
         };
 
-        let artifact = match store.load(cache_key).await {
-            Ok(Some(a)) => a,
-            _ => return Ok(None),
+        let Some(entry) = cache.get(cache_key).await else {
+            return Ok(None);
         };
 
-        let decision = self.policy.evaluate_cache(&artifact);
+        let decision = self.policy.evaluate_cache(&entry);
 
-        if matches!(decision, CacheDecision::Use) {
-            let outcome = CrawlPageOutcome::Opened {
-                resolution: artifact.resolution.clone(),
-                status_code: artifact.status_code,
-                telemetry: artifact.telemetry.clone(),
-                non_critical_errors: artifact.non_critical_errors.clone(),
-                page_info: artifact.extracted.page_info.clone(),
-                anchors: artifact.extracted.anchors.clone(),
-                snapshot: if artifact.snapshot.body.is_empty() {
-                    SnapshotDecision::NotRequested
-                } else {
-                    SnapshotDecision::Captured {
-                        html_bytes: artifact.snapshot.body.len(),
-                        body_sha256_hex: artifact.snapshot.body_sha256_hex.clone(),
-                    }
-                },
-            };
-
-            let result = CrawlPageResult {
-                request: request.clone(),
-                cache_key: Some(cache_key.clone()),
-                cache_decision: Some(decision),
-                outcome,
-            };
-            return Ok(Some(result));
+        if !matches!(decision, CacheDecision::Use) {
+            return Ok(None);
         }
 
-        Ok(None)
+        let Some(primary) = entry.metadata.primary_payload() else {
+            return Ok(None);
+        };
+
+        let resolution = serde_json::from_value(
+            entry
+                .metadata
+                .extracted_json
+                .get("resolution")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .ok();
+
+        let page_info = serde_json::from_value(
+            entry
+                .metadata
+                .extracted_json
+                .get("page_info")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .ok();
+
+        let anchors = serde_json::from_value(
+            entry
+                .metadata
+                .extracted_json
+                .get("anchors")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )
+        .unwrap_or_default();
+
+        let telemetry = serde_json::from_value(entry.metadata.telemetry_json.clone()).ok();
+
+        let non_critical_errors = entry
+            .metadata
+            .non_critical_errors_json
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+
+        let Some(resolution) = resolution else {
+            return Ok(None);
+        };
+
+        let Some(telemetry) = telemetry else {
+            return Ok(None);
+        };
+
+        let outcome = CrawlPageOutcome::Opened {
+            resolution,
+            status_code: entry.metadata.response.status_code,
+            telemetry,
+            non_critical_errors,
+            page_info,
+            anchors,
+            snapshot: if primary.byte_len > 0 {
+                SnapshotDecision::Captured {
+                    html_bytes: primary.byte_len,
+                    body_sha256_hex: primary.sha256_hex.clone(),
+                }
+            } else {
+                SnapshotDecision::NotRequested
+            },
+        };
+
+        Ok(Some(CrawlPageResult {
+            request: request.clone(),
+            cache_key: Some(cache_key.clone()),
+            cache_decision: Some(decision),
+            outcome,
+        }))
     }
 
     pub async fn crawl(&self, seeds: Vec<CrawlRequest<P>>) -> CrawlEngineResult<CrawlRunResult<P>> {
@@ -268,7 +344,7 @@ where
         &self,
         request: &CrawlRequest<P>,
         cache_key: CacheKey,
-        _assignment: BrowserProfileAssignment,
+        assignment: BrowserProfileAssignment,
         session: &mut web_browser_driver::BrowserSession,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
         {
@@ -308,7 +384,7 @@ where
         let snapshot = match &html {
             Some(h) => SnapshotDecision::Captured {
                 html_bytes: h.len(),
-                body_sha256_hex: crate::cache::sha256_hex(h.as_bytes()),
+                body_sha256_hex: crate::sqlite_cache::model::sha256_hex(h.as_bytes()),
             },
             None if self.policy.snapshot.capture_html => SnapshotDecision::Rejected {
                 reason: "failed to capture HTML".into(),
@@ -332,45 +408,73 @@ where
         };
 
         // Persist artifact if HTML was captured and caching is enabled
-        if let (true, Some(store)) = (self.config.cache_enabled, &self.cache_store) {
-            if let Some(html_str) = html {
-                let body = html_str.into_bytes();
-                let body_sha256_hex = crate::cache::sha256_hex(&body);
+        // === Save to new SqliteCache if enabled ===
+        if self.config.cache_enabled {
+            if let Some(cache) = &self.sqlite_cache {
+                if let Some(html_str) = html {
+                    let body = html_str.into_bytes();
+                    let now_ms = now_unix_ms();
 
-                let now_ms: i64 = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-
-                let artifact = crate::cache::CachedPageArtifact {
-                    artifact_version: crate::cache::CACHED_PAGE_ARTIFACT_VERSION,
-                    cache_key: cache_key.clone(),
-                    stored_at_unix_ms: now_ms,
-                    producer: crate::cache::CacheProducerInfo {
-                        engine_name: "web-crawler-engine-v3".to_string(),
-                        engine_version: "0.1.0".to_string(),
-                        driver_version: None,
-                        cache_policy_version: self.policy.cache.policy_version,
-                    },
-                    resolution: opened.resolution,
-                    status_code: opened.status_code,
-                    telemetry: opened.telemetry,
-                    non_critical_errors: opened.non_critical_errors,
-                    snapshot: crate::cache::CacheSnapshot {
-                        captured_at_unix_ms: now_ms,
-                        content_type: Some("text/html".to_string()),
+                    let snapshot_payload = CachePayload::new(
+                        "primary",
+                        CachePayloadRole::PrimarySnapshot,
+                        Some("text/html".to_string()),
+                        CachePayloadCompression::None,
                         body,
-                        compression: crate::cache::SnapshotCompression::None,
-                        body_sha256_hex,
-                    },
-                    extracted: crate::cache::CachedExtractedFacts {
-                        page_info,
-                        anchors,
-                    },
-                };
+                    );
 
-                if let Err(e) = store.save(&cache_key, &artifact).await {
-                    tracing::warn!("failed to save cache artifact for {:?}: {}", cache_key, e);
+                    let mut metadata = CacheEntryMetadata::new_page(
+                        cache_key.clone(),
+                        now_ms,
+                        crate::sqlite_cache::CacheProducerInfo {
+                            engine_name: "web-crawler-engine-v3".to_string(),
+                            engine_version: "0.1.0".to_string(),
+                            driver_version: None,
+                            cache_policy_version: self.policy.cache.policy_version,
+                        },
+                        crate::sqlite_cache::CacheRequestInfo {
+                            requested_url: request.requested_url.to_string(),
+                            requested_host: request.requested_url.host_str().map(|s| s.to_string()),
+                            profile_key_json: serde_json::to_value(&assignment.key).unwrap_or_default(),
+                            namespace: None,
+                        },
+                        crate::sqlite_cache::CacheResponseInfo {
+                            final_url: Some(opened.resolution.final_url.to_string()),
+                            final_host: opened
+                                .resolution
+                                .final_url
+                                .host_str()
+                                .map(|s| s.to_string()),
+                            status_code: opened.status_code,
+                            content_type: Some("text/html".to_string()),
+                        },
+                        vec![snapshot_payload.descriptor.clone()],
+                    );
+
+                    metadata.extracted_json = serde_json::json!({
+                        "page_info": page_info,
+                        "anchors": anchors,
+                        "resolution": opened.resolution,
+                    });
+
+                    metadata.telemetry_json =
+                        serde_json::to_value(&opened.telemetry).unwrap_or_default();
+
+                    metadata.non_critical_errors_json = opened
+                        .non_critical_errors
+                        .iter()
+                        .filter_map(|e| serde_json::to_value(e).ok())
+                        .collect();
+
+                    let cache_entry = CacheEntry {
+                        metadata,
+                        payloads: vec![snapshot_payload],
+                        tags: vec![],
+                    };
+
+                    if let Err(e) = cache.put(&cache_entry).await {
+                        tracing::warn!("failed to save sqlite cache entry: {}", e);
+                    }
                 }
             }
         }
@@ -379,4 +483,5 @@ where
         Ok(result)
     }
 }
+
 

@@ -2477,6 +2477,7 @@ dependencies = [
  "colored",
  "colored_json",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

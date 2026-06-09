@@ -29,14 +29,43 @@ use serde::{
 use url::Url;
 
 use crate::{
-    cache::{
-        CacheDecision,
-        CachePolicy,
-        CachedPageArtifact,
-    },
     config::CrawlLimits,
     input::CrawlRequest,
+    sqlite_cache::{CacheEntry, CACHE_ENTRY_KIND_PAGE, CACHE_METADATA_VERSION},
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CachePolicy {
+    /// Bump this when cache acceptance semantics change.
+    ///
+    /// The cache entry stores the producer policy version. If this differs,
+    /// the entry should be treated as stale and regenerated.
+    pub policy_version: u32,
+
+    /// Optional maximum cache age.
+    ///
+    /// `None` means cache entries do not expire by age at this layer.
+    pub max_age_ms: Option<i64>,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            policy_version: 1,
+            max_age_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDecision {
+    Use,
+    Reject {
+        reason: String,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,8 +216,51 @@ impl CrawlPolicy {
         }
     }
 
-    pub fn evaluate_cache(&self, artifact: &CachedPageArtifact) -> CacheDecision {
-        self.cache.evaluate(artifact)
+    pub fn evaluate_cache(&self, entry: &CacheEntry) -> CacheDecision {
+        let metadata = &entry.metadata;
+
+        if metadata.metadata_version != CACHE_METADATA_VERSION {
+            return CacheDecision::Reject {
+                reason: format!(
+                    "metadata version {} != current {}",
+                    metadata.metadata_version,
+                    CACHE_METADATA_VERSION
+                ),
+            };
+        }
+
+        if metadata.entry_kind != CACHE_ENTRY_KIND_PAGE {
+            return CacheDecision::Reject {
+                reason: format!("unsupported cache entry kind {}", metadata.entry_kind),
+            };
+        }
+
+        if metadata.producer.cache_policy_version != self.cache.policy_version {
+            return CacheDecision::Reject {
+                reason: format!(
+                    "cache policy version {} != current {}",
+                    metadata.producer.cache_policy_version,
+                    self.cache.policy_version
+                ),
+            };
+        }
+
+        if let Some(max_age_ms) = self.cache.max_age_ms {
+            let age_ms = crate::sqlite_cache::now_unix_ms() - metadata.stored_at_unix_ms;
+            if age_ms > max_age_ms {
+                return CacheDecision::Reject {
+                    reason: format!("cache age {}ms exceeds max {}ms", age_ms, max_age_ms),
+                };
+            }
+        }
+
+        if metadata.primary_payload().is_none() {
+            return CacheDecision::Reject {
+                reason: "cache entry has no primary payload".into(),
+            };
+        }
+
+        CacheDecision::Use
     }
 }
 
