@@ -24,7 +24,7 @@ struct Cli {
     profile_root: PathBuf,
 
     /// SQLite cache database path
-    #[arg(long, default_value = "./output/web-bot/cache.sqlite")]
+    #[arg(long, default_value = "./output/web-bot/db/cache.sqlite")]
     cache_db: PathBuf,
 }
 
