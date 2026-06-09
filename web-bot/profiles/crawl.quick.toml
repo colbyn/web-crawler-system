@@ -5,18 +5,18 @@
 # web-bot crawl --config web-bot/config/crawl.quick.toml -i https://example.com
 #
 
-[input]
-urls = []
-format = "text"
-url-pointer = "/url"
-attach-provenance = false
+# [input]
+# urls = []
+# format = "text"
+# url-pointer = "/url"
+# attach-provenance = false
 
-[tags]
-global = ["run:quick"]
-pointers = []
+# [tags]
+# global = ["run:quick"]
+# pointers = []
 
-[output]
-format = "human"
+# [output]
+# format = "human"
 
 [budget]
 pages = 10

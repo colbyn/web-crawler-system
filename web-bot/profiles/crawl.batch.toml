@@ -8,21 +8,21 @@
 # cat businesses.ndjson | web-bot crawl --config web-bot/config/crawl.batch.toml
 #
 
-[input]
-urls = ["-"]
-format = "ndjson"
-url-pointer = "/website"
-attach-provenance = false
+# [input]
+# urls = ["-"]
+# format = "ndjson"
+# url-pointer = "/website"
+# attach-provenance = false
 
-[tags]
-global = ["run:batch"]
-pointers = [
-  "entity=/id",
-  "category=/categories"
-]
+# [tags]
+# global = ["run:batch"]
+# pointers = [
+#   "entity=/id",
+#   "category=/categories"
+# ]
 
-[output]
-format = "human"
+# [output]
+# format = "human"
 
 [budget]
 pages = 10

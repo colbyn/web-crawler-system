@@ -9,21 +9,21 @@
 #   > crawl-results.ndjson
 # ```
 
-[input]
-urls = ["-"]
-format = "ndjson"
-url-pointer = "/website"
-attach-provenance = false
+# [input]
+# urls = ["-"]
+# format = "ndjson"
+# url-pointer = "/website"
+# attach-provenance = false
 
-[tags]
-global = ["run:ndjson-output"]
-pointers = [
-  "entity=/id",
-  "category=/categories"
-]
+# [tags]
+# global = ["run:ndjson-output"]
+# pointers = [
+#   "entity=/id",
+#   "category=/categories"
+# ]
 
-[output]
-format = "ndjson"
+# [output]
+# format = "ndjson"
 
 [budget]
 pages = 10

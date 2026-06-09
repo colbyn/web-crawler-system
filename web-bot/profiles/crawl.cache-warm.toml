@@ -5,18 +5,18 @@
 # cat urls.txt | web-bot crawl --config web-bot/config/crawl.cache-warm.toml
 #
 
-[input]
-urls = ["-"]
-format = "text"
-url-pointer = "/url"
-attach-provenance = false
+# [input]
+# urls = ["-"]
+# format = "text"
+# url-pointer = "/url"
+# attach-provenance = false
 
-[tags]
-global = ["run:cache-warm"]
-pointers = []
+# [tags]
+# global = ["run:cache-warm"]
+# pointers = []
 
-[output]
-format = "human"
+# [output]
+# format = "human"
 
 [budget]
 pages = 3
