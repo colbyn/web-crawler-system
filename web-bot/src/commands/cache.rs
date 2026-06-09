@@ -1,18 +1,41 @@
 //! Cache inspection and management commands.
+//!
+//! This command module provides operational tools for looking inside the shared
+//! SQLite cache used by the crawler.
+//!
+//! The cache stores reusable page artifacts. Tags are a secondary association
+//! layer over those artifacts. Tags are structured as:
+//!
+//! ```text
+//! kind:key
+//! ```
+//!
+//! Examples:
+//!
+//! ```text
+//! entity:business-123
+//! category:electricians
+//! run:manual-debug
+//! ```
+//!
+//! This CLI accepts tags in their compound textual form, then converts them to
+//! `CacheTag { kind, key }` before calling the cache API.
 
 use clap::Subcommand;
 use sqlx::Row;
 use std::path::PathBuf;
 
 use web_browser_driver::BrowserProfileKey;
+use web_crawler_engine_v3::sqlite_cache::{
+    cache_key_digest,
+    CacheEntry,
+    CacheKey,
+    CachePayload,
+    CachePayloadCompression,
+    CachePayloadRole,
+    CacheTag,
+};
 use web_crawler_engine_v3::SqliteCache;
-use web_crawler_engine_v3::sqlite_cache::cache_key_digest;
-use web_crawler_engine_v3::sqlite_cache::CacheEntry;
-use web_crawler_engine_v3::sqlite_cache::CacheKey;
-use web_crawler_engine_v3::sqlite_cache::CachePayloadCompression;
-use web_crawler_engine_v3::sqlite_cache::CachePayloadRole;
-use web_crawler_engine_v3::sqlite_cache::CacheTag;
-use web_crawler_engine_v3::sqlite_cache::CachePayload;
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCommands {
@@ -82,7 +105,15 @@ pub enum CacheCommands {
         json: bool,
     },
 
-    /// Add tags to one cached URL
+    /// Add tags to one cached URL.
+    ///
+    /// Tag format: kind:key
+    ///
+    /// Examples:
+    ///
+    /// - entity:business-123
+    /// - category:electricians
+    /// - run:manual-debug
     Tag {
         url: String,
 
@@ -92,13 +123,37 @@ pub enum CacheCommands {
         #[arg(long)]
         namespace: Option<String>,
 
-        /// Tags to add
+        /// Tags to add, in kind:key form
         tags: Vec<String>,
     },
 
-    /// List entries by tag
+    /// List cache entries by exact tag.
+    ///
+    /// Tag format: kind:key
     ListByTag {
         tag: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List cache entries carrying any tag of this kind.
+    ///
+    /// Examples:
+    ///
+    /// - entity
+    /// - category
+    /// - run
+    ListByTagKind {
+        kind: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List known tags of a given kind.
+    ListTagsByKind {
+        kind: String,
 
         #[arg(long)]
         json: bool,
@@ -157,6 +212,14 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
         CacheCommands::ListByTag { tag, json } => {
             list_by_tag(&cache, &tag, json).await?;
         }
+
+        CacheCommands::ListByTagKind { kind, json } => {
+            list_by_tag_kind(&cache, &kind, json).await?;
+        }
+
+        CacheCommands::ListTagsByKind { kind, json } => {
+            list_tags_by_kind(&cache, &kind, json).await?;
+        }
     }
 
     Ok(())
@@ -172,6 +235,27 @@ fn key_for_url(
         BrowserProfileKey::new(profile_key),
         namespace,
     ))
+}
+
+fn parse_tag(value: &str) -> anyhow::Result<CacheTag> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        anyhow::bail!("tag cannot be empty");
+    }
+
+    if !trimmed.contains(':') {
+        anyhow::bail!(
+            "tag `{}` must use kind:key format, e.g. entity:business-123",
+            trimmed
+        );
+    }
+
+    Ok(CacheTag::from_compound(trimmed))
+}
+
+fn parse_tags(values: Vec<String>) -> anyhow::Result<Vec<CacheTag>> {
+    values.iter().map(|value| parse_tag(value)).collect()
 }
 
 fn primary_payload(entry: &CacheEntry) -> Option<&CachePayload> {
@@ -217,7 +301,17 @@ async fn lookup_metadata(
             let value = serde_json::json!({
                 "metadata": entry.metadata,
                 "payloads": payload_summary,
-                "tags": entry.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "tags": entry
+                    .tags
+                    .iter()
+                    .map(|tag| {
+                        serde_json::json!({
+                            "kind": tag.kind(),
+                            "key": tag.key(),
+                            "tag": tag.as_compound(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             });
 
             if json {
@@ -243,8 +337,8 @@ async fn lookup_metadata(
                     .metadata
                     .extracted_json
                     .get("anchors")
-                    .and_then(|v| v.as_array())
-                    .map(|v| v.len())
+                    .and_then(|value| value.as_array())
+                    .map(|value| value.len())
                     .unwrap_or(0);
 
                 eprintln!("  Anchors:        {}", anchors_len);
@@ -253,7 +347,7 @@ async fn lookup_metadata(
                     .metadata
                     .extracted_json
                     .pointer("/page_info/title")
-                    .and_then(|v| v.as_str())
+                    .and_then(|value| value.as_str())
                 {
                     eprintln!("  Title:          {}", title);
                 }
@@ -264,7 +358,7 @@ async fn lookup_metadata(
                         entry
                             .tags
                             .iter()
-                            .map(|t| t.as_str())
+                            .map(|tag| tag.as_compound())
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
@@ -327,7 +421,12 @@ async fn remove_url(
 ) -> anyhow::Result<()> {
     if !force {
         eprint!("Remove {} from cache? [y/N]: ", url);
-        use std::io::{self, Write};
+
+        use std::io::{
+            self,
+            Write,
+        };
+
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -364,7 +463,12 @@ async fn clear_cache(
     if !force {
         eprintln!("This will delete ALL cache rows in: {}", cache_db.display());
         eprint!("Are you sure? [y/N]: ");
-        use std::io::{self, Write};
+
+        use std::io::{
+            self,
+            Write,
+        };
+
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -469,10 +573,18 @@ async fn tag_url(
         anyhow::bail!("URL not found in cache: {}", url);
     }
 
-    let tags = tags.into_iter().map(CacheTag::new).collect::<Vec<_>>();
+    let tags = parse_tags(tags)?;
     cache.tag(&cache_key, &tags).await?;
 
-    eprintln!("✅ Tagged {} with {} tag(s).", url, tags.len());
+    eprintln!(
+        "✅ Tagged {} with {}",
+        url,
+        tags.iter()
+            .map(|tag| tag.as_compound())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     Ok(())
 }
 
@@ -481,13 +593,13 @@ async fn list_by_tag(
     tag: &str,
     json: bool,
 ) -> anyhow::Result<()> {
-    let tag = CacheTag::new(tag);
+    let tag = parse_tag(tag)?;
     let refs = cache.list_by_tag(&tag).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&refs)?);
     } else if refs.is_empty() {
-        eprintln!("No cache entries found for tag: {}", tag.as_str());
+        eprintln!("No cache entries found for tag: {}", tag.as_compound());
     } else {
         for entry in refs {
             println!(
@@ -503,3 +615,59 @@ async fn list_by_tag(
     Ok(())
 }
 
+async fn list_by_tag_kind(
+    cache: &SqliteCache,
+    kind: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let refs = cache.list_by_tag_kind(kind).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&refs)?);
+    } else if refs.is_empty() {
+        eprintln!("No cache entries found for tag kind: {}", kind);
+    } else {
+        for entry in refs {
+            println!(
+                "{}\t{}\t{:?}\t{}",
+                entry.stored_at_unix_ms,
+                entry.requested_url,
+                entry.status_code,
+                entry.key_digest,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn list_tags_by_kind(
+    cache: &SqliteCache,
+    kind: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let tags = cache.list_tags_by_kind(kind).await?;
+
+    if json {
+        let value = tags
+            .iter()
+            .map(|tag| {
+                serde_json::json!({
+                    "kind": tag.kind(),
+                    "key": tag.key(),
+                    "tag": tag.as_compound(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if tags.is_empty() {
+        eprintln!("No tags found for kind: {}", kind);
+    } else {
+        for tag in tags {
+            println!("{}", tag.as_compound());
+        }
+    }
+
+    Ok(())
+}

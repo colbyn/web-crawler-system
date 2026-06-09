@@ -1,66 +1,126 @@
-//! `SqliteCache` — main implementation and public API surface.
+//! SQLite cache implementation.
 //!
-//! This is the primary type used by the crawler and downstream components.
-//! It provides:
+//! This module owns the concrete SQLite-backed cache used by the crawler.
 //!
-//! - A simple, forgiving hot path (`get` / `put`)
-//! - Rich tag-based grouping and bulk lifecycle operations
-//! - Per-entry auxiliary key/value storage for derived data
-//! - Diagnostic capabilities via `inspect` (when implemented)
-//! - Direct access to the underlying `SqlitePool` for advanced use
+//! The cache has two related but distinct roles:
 //!
-//! The implementation uses a single connection pool with WAL mode and foreign
-//! key support. Writes that modify multiple tables (entry + payloads + tags)
-//! are performed inside transactions where appropriate.
+//! 1. **Performance cache**
+//!    Avoid repeated browser work by reusing previously captured page artifacts.
 //!
-//! See `mod.rs` for the overall design philosophy of the cache layer.
-
+//! 2. **Persistent artifact store**
+//!    Keep crawl artifacts, payloads, tags, and derived auxiliary values available
+//!    for downstream tools.
+//!
+//! ## Cache identity
+//!
+//! Cache identity is defined by [`CacheKey`] and stored as a stable digest.
+//! The key is request-addressed: requested URL, browser profile key, namespace,
+//! and key/schema versions.
+//!
+//! Runtime facts such as final URL, redirects, status code, telemetry, and
+//! extracted page data are stored in metadata, not used as the primary lookup
+//! identity.
+//!
+//! ## Tags
+//!
+//! Tags are a secondary many-to-many index over cache entries.
+//!
+//! Tags are intentionally structured as:
+//!
+//! ```text
+//! tag_kind + tag_key
+//! ```
+//!
+//! Examples:
+//!
+//! ```text
+//! entity:business-123
+//! category:electricians
+//! category:hvac
+//! run:manual-debug
+//! ```
+//!
+//! This supports two important query modes:
+//!
+//! - exact tag lookup: all entries tagged `entity:business-123`
+//! - kind lookup: all entries with any `entity` tag
+//!
+//! Tags are not part of cache identity. Multiple seeds, entities, runs, and
+//! categories may point at the same cached artifact. Therefore `put()` merges
+//! tags instead of replacing them. Destructive replacement is available only via
+//! [`SqliteCache::replace_tags`].
+//!
+//! ## Auxiliary values
+//!
+//! `cache_auxiliary` is reserved for post-processing and derived data attached
+//! to an artifact, such as classifications, extracted contact info, summaries,
+//! scores, or downstream analysis results.
+//!
+//! Do not use auxiliary storage for caller/seed associations. Use tags for that.
 
 use std::path::Path;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
-use sqlx::Row;
 
-// use crate::sqlite_cache::now_unix_ms;
-use crate::sqlite_cache::CacheEntry;
-use crate::sqlite_cache::CacheEntryRef;
-use crate::sqlite_cache::CacheError;
-use crate::sqlite_cache::CacheKey;
-use crate::sqlite_cache::CacheResult;
-use crate::sqlite_cache::CacheTag;
-// use crate::sqlite_cache::CACHE_METADATA_VERSION;
-use crate::sqlite_cache::CacheEntryMetadata;
-use crate::sqlite_cache::cache_key_digest;
-use crate::sqlite_cache::CachePayload;
+use sqlx::{
+    Row,
+    Sqlite,
+    SqlitePool,
+    Transaction,
+};
+use sqlx::sqlite::{
+    SqliteConnectOptions,
+    SqliteJournalMode,
+    SqlitePoolOptions,
+    SqliteRow,
+    SqliteSynchronous,
+};
+
+use crate::sqlite_cache::{
+    cache_key_digest,
+    CacheEntry,
+    CacheEntryMetadata,
+    CacheEntryRef,
+    CacheError,
+    CacheKey,
+    CachePayload,
+    CacheResult,
+    CacheTag,
+};
 
 /// Main SQLite-backed cache for the web crawler engine.
 ///
 /// It stores:
-/// - Core crawl metadata and binary payloads
-/// - Tags for grouping and application-level linking
-/// - Auxiliary key/value data for downstream post-processing
+///
+/// - cache entry metadata,
+/// - binary payloads,
+/// - structured tags,
+/// - derived auxiliary values.
+///
+/// The hot path is intentionally forgiving: [`SqliteCache::get`] returns
+/// `None` for entry-level problems instead of failing the whole crawl.
 #[derive(Debug, Clone)]
 pub struct SqliteCache {
     pool: SqlitePool,
 }
 
 impl SqliteCache {
-    /// Open (or create) the cache database at the given path.
+    /// Open or create the cache database at the given path.
     ///
-    /// This will create the database file if it doesn't exist and run
-    /// all necessary migrations.
+    /// This creates the parent directory if needed, opens SQLite in WAL mode,
+    /// enables foreign keys, and runs idempotent schema creation.
     pub async fn open(path: impl AsRef<Path>) -> CacheResult<Self> {
         let path = path.as_ref();
+
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            std::fs::create_dir_all(parent)?;
         }
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5)); // ← Added
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -69,21 +129,23 @@ impl SqliteCache {
 
         let cache = Self { pool };
         cache.migrate().await?;
+
         Ok(cache)
     }
 
-    /// Returns a reference to the underlying connection pool.
-    /// Useful for advanced queries or integration with other systems.
+    /// Return the underlying SQLx pool.
+    ///
+    /// This is intentionally exposed so downstream tools can issue advanced
+    /// SQLite queries without forcing this module to grow every possible helper.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    // ============================================================
+    // ————————————————————————————————————————————————————————————————————————
     // Schema
-    // ============================================================
+    // ————————————————————————————————————————————————————————————————————————
 
     async fn migrate(&self) -> CacheResult<()> {
-        // cache_entries
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_entries (
@@ -107,20 +169,24 @@ impl SqliteCache {
         .execute(&self.pool)
         .await?;
 
-        // Useful indexes
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_cache_entries_requested_host ON cache_entries(requested_host);"
-        ).execute(&self.pool).await?;
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_requested_host ON cache_entries(requested_host);",
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_cache_entries_final_host ON cache_entries(final_host);"
-        ).execute(&self.pool).await?;
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_final_host ON cache_entries(final_host);",
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_cache_entries_stored_at ON cache_entries(stored_at_unix_ms);"
-        ).execute(&self.pool).await?;
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_stored_at ON cache_entries(stored_at_unix_ms);",
+        )
+        .execute(&self.pool)
+        .await?;
 
-        // cache_payloads
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_payloads (
@@ -140,16 +206,32 @@ impl SqliteCache {
         .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_cache_payloads_key_digest ON cache_payloads(key_digest);"
-        ).execute(&self.pool).await?;
+            "CREATE INDEX IF NOT EXISTS idx_cache_payloads_key_digest ON cache_payloads(key_digest);",
+        )
+        .execute(&self.pool)
+        .await?;
 
-        // Tags
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_tags (
-                tag TEXT PRIMARY KEY
+                tag_kind TEXT NOT NULL,
+                tag_key  TEXT NOT NULL,
+                tag      TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (tag_kind, tag_key)
             );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cache_tags_kind ON cache_tags(tag_kind);",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cache_tags_tag ON cache_tags(tag);",
         )
         .execute(&self.pool)
         .await?;
@@ -157,9 +239,14 @@ impl SqliteCache {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_entry_tags (
-                tag         TEXT NOT NULL REFERENCES cache_tags(tag) ON DELETE CASCADE,
-                key_digest  TEXT NOT NULL REFERENCES cache_entries(key_digest) ON DELETE CASCADE,
-                PRIMARY KEY (tag, key_digest)
+                tag_kind   TEXT NOT NULL,
+                tag_key    TEXT NOT NULL,
+                tag        TEXT NOT NULL,
+                key_digest TEXT NOT NULL REFERENCES cache_entries(key_digest) ON DELETE CASCADE,
+                PRIMARY KEY (tag_kind, tag_key, key_digest),
+                FOREIGN KEY (tag_kind, tag_key)
+                    REFERENCES cache_tags(tag_kind, tag_key)
+                    ON DELETE CASCADE
             );
             "#,
         )
@@ -167,10 +254,23 @@ impl SqliteCache {
         .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_cache_entry_tags_key_digest ON cache_entry_tags(key_digest);"
-        ).execute(&self.pool).await?;
+            "CREATE INDEX IF NOT EXISTS idx_cache_entry_tags_key_digest ON cache_entry_tags(key_digest);",
+        )
+        .execute(&self.pool)
+        .await?;
 
-        // Auxiliary key/value data
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cache_entry_tags_kind ON cache_entry_tags(tag_kind);",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cache_entry_tags_tag ON cache_entry_tags(tag);",
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cache_auxiliary (
@@ -189,13 +289,22 @@ impl SqliteCache {
 }
 
 // ————————————————————————————————————————————————————————————————————————————
-// Core Hot Path Implementation
+// Core Hot Path
 // ————————————————————————————————————————————————————————————————————————————
 
 impl SqliteCache {
-
-    /// Retrieve a cache entry if it exists and is valid.
-    /// Returns `None` on any per-entry problem (missing, decode failure, checksum mismatch, etc.).
+    /// Retrieve a cache entry if it exists and passes basic load validation.
+    ///
+    /// Returns `None` on ordinary cache-entry problems:
+    ///
+    /// - no row,
+    /// - JSON decode failure,
+    /// - checksum mismatch,
+    /// - corrupt payload metadata,
+    /// - other per-entry load failures.
+    ///
+    /// This keeps cache failure from poisoning a crawl. The crawler can treat
+    /// `None` as a miss and recrawl.
     pub async fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
         match self.load_entry_raw(key).await {
             Ok(Some(entry)) => Some(entry),
@@ -210,7 +319,16 @@ impl SqliteCache {
         }
     }
 
-    /// Store or overwrite a complete cache entry (metadata + payloads + current tags).
+    /// Store or overwrite cache metadata and payloads, while merging tags.
+    ///
+    /// Important semantics:
+    ///
+    /// - `cache_entries` is upserted.
+    /// - `cache_payloads` for this entry are replaced atomically.
+    /// - tags are merged with existing tags.
+    ///
+    /// Tags are **not** replaced because cache entries are reusable artifacts.
+    /// Multiple seeds/entities/categories/runs may point at the same artifact.
     pub async fn put(&self, entry: &CacheEntry) -> CacheResult<()> {
         let key = entry.key();
         let key_digest = cache_key_digest(key)?;
@@ -226,7 +344,6 @@ impl SqliteCache {
 
         let mut tx = self.pool.begin().await?;
 
-        // Upsert main entry
         sqlx::query(
             r#"
             INSERT INTO cache_entries (
@@ -268,84 +385,71 @@ impl SqliteCache {
         .execute(&mut *tx)
         .await?;
 
-        // Replace payloads atomically
         sqlx::query("DELETE FROM cache_payloads WHERE key_digest = ?")
             .bind(&key_digest)
             .execute(&mut *tx)
             .await?;
 
         for payload in &entry.payloads {
-            let d = &payload.descriptor;
+            let descriptor = &payload.descriptor;
+
             sqlx::query(
                 r#"
                 INSERT INTO cache_payloads (
-                    payload_id, key_digest, role, media_type, compression,
+                    key_digest, payload_id, role, media_type, compression,
                     sha256_hex, byte_len, body
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
-            .bind(&d.payload_id)
             .bind(&key_digest)
-            .bind(d.role.as_db_str())
-            .bind(&d.media_type)
-            .bind(d.compression.as_db_str())
-            .bind(&d.sha256_hex)
-            .bind(d.byte_len as i64)
+            .bind(&descriptor.payload_id)
+            .bind(descriptor.role.as_db_str())
+            .bind(&descriptor.media_type)
+            .bind(descriptor.compression.as_db_str())
+            .bind(&descriptor.sha256_hex)
+            .bind(descriptor.byte_len as i64)
             .bind(&payload.body)
             .execute(&mut *tx)
             .await?;
         }
 
-        // Replace tag set for this entry
-        sqlx::query("DELETE FROM cache_entry_tags WHERE key_digest = ?")
-            .bind(&key_digest)
-            .execute(&mut *tx)
-            .await?;
-
         for tag in &entry.tags {
-            sqlx::query("INSERT OR IGNORE INTO cache_tags (tag) VALUES (?)")
-                .bind(tag.as_str())
-                .execute(&mut *tx)
-                .await?;
-
-            sqlx::query(
-                "INSERT OR IGNORE INTO cache_entry_tags (tag, key_digest) VALUES (?, ?)"
-            )
-            .bind(tag.as_str())
-            .bind(&key_digest)
-            .execute(&mut *tx)
-            .await?;
+            insert_tag_link_tx(&mut tx, &key_digest, tag).await?;
         }
 
         tx.commit().await?;
+
         Ok(())
     }
 
-    // ———————————————————————————————————————————————————————————————————————-
+    // ————————————————————————————————————————————————————————————————————————
     // Internal Loading Logic
-    // ———————————————————————————————————————————————————————————————————————-
+    // ————————————————————————————————————————————————————————————————————————
 
     async fn load_entry_raw(&self, key: &CacheKey) -> CacheResult<Option<CacheEntry>> {
         let key_digest = cache_key_digest(key)?;
 
         let row = sqlx::query(
-            "SELECT metadata_json FROM cache_entries WHERE key_digest = ?"
+            "SELECT metadata_json FROM cache_entries WHERE key_digest = ?",
         )
         .bind(&key_digest)
         .fetch_optional(&self.pool)
         .await?;
 
-        let Some(row) = row else { return Ok(None); };
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
         let metadata_json: String = row.try_get("metadata_json")?;
         let metadata: CacheEntryMetadata = serde_json::from_str(&metadata_json)
             .map_err(|e| CacheError::Json(e.to_string()))?;
 
-        // Load and validate payloads
         let payload_rows = sqlx::query(
             r#"
-            SELECT payload_id, role, media_type, compression, sha256_hex, byte_len, body
-            FROM cache_payloads WHERE key_digest = ? ORDER BY payload_id
+            SELECT payload_id, body
+            FROM cache_payloads
+            WHERE key_digest = ?
+            ORDER BY payload_id
             "#,
         )
         .bind(&key_digest)
@@ -353,71 +457,114 @@ impl SqliteCache {
         .await?;
 
         let mut payloads = Vec::new();
-        for prow in payload_rows {
-            let payload_id: String = prow.try_get("payload_id")?;
-            let body: Vec<u8> = prow.try_get("body")?;
 
-            if let Some(descriptor) = metadata
+        for payload_row in payload_rows {
+            let payload_id: String = payload_row.try_get("payload_id")?;
+            let body: Vec<u8> = payload_row.try_get("body")?;
+
+            let Some(descriptor) = metadata
                 .payloads
                 .iter()
-                .find(|d| d.payload_id == payload_id)
+                .find(|descriptor| descriptor.payload_id == payload_id)
                 .cloned()
-            {
-                let observed = crate::sqlite_cache::model::sha256_hex(&body);
-                if observed != descriptor.sha256_hex {
-                    return Err(CacheError::Invariant(format!(
-                        "checksum mismatch on payload {}", payload_id
-                    )));
-                }
-                payloads.push(CachePayload { descriptor, body });
+            else {
+                tracing::warn!(
+                    key_digest = %key_digest,
+                    payload_id = %payload_id,
+                    "cache payload exists without matching metadata descriptor"
+                );
+                continue;
+            };
+
+            let observed_sha256 = crate::sqlite_cache::model::sha256_hex(&body);
+
+            if observed_sha256 != descriptor.sha256_hex {
+                return Err(CacheError::Invariant(format!(
+                    "checksum mismatch on payload {payload_id}"
+                )));
             }
+
+            if body.len() != descriptor.byte_len {
+                return Err(CacheError::Invariant(format!(
+                    "byte length mismatch on payload {payload_id}: observed {}, expected {}",
+                    body.len(),
+                    descriptor.byte_len
+                )));
+            }
+
+            payloads.push(CachePayload { descriptor, body });
         }
 
-        // Load tags
         let tag_rows = sqlx::query(
-            "SELECT tag FROM cache_entry_tags WHERE key_digest = ? ORDER BY tag"
+            r#"
+            SELECT tag_kind, tag_key
+            FROM cache_entry_tags
+            WHERE key_digest = ?
+            ORDER BY tag_kind, tag_key
+            "#,
         )
         .bind(&key_digest)
         .fetch_all(&self.pool)
         .await?;
 
         let mut tags = Vec::new();
-        for trow in tag_rows {
-            let t: String = trow.try_get("tag")?;
-            tags.push(CacheTag::new(t));
+
+        for tag_row in tag_rows {
+            let kind: String = tag_row.try_get("tag_kind")?;
+            let key: String = tag_row.try_get("tag_key")?;
+            tags.push(CacheTag::raw(kind, key));
         }
 
-        Ok(Some(CacheEntry { metadata, payloads, tags }))
+        Ok(Some(CacheEntry {
+            metadata,
+            payloads,
+            tags,
+        }))
     }
 }
-
-
 
 // ————————————————————————————————————————————————————————————————————————————
 // Tag Operations
 // ————————————————————————————————————————————————————————————————————————————
 
 impl SqliteCache {
-
-    /// Add one or more tags to a cache entry.
-    /// Tags are normalized on insertion. Existing tags are preserved.
+    /// Add tags to a cache entry.
+    ///
+    /// Existing tags are preserved. This is merge/upsert behavior.
     pub async fn tag(&self, key: &CacheKey, tags: &[CacheTag]) -> CacheResult<()> {
         let key_digest = cache_key_digest(key)?;
 
         for tag in tags {
-            sqlx::query("INSERT OR IGNORE INTO cache_tags (tag) VALUES (?)")
-                .bind(tag.as_str())
-                .execute(&self.pool)
-                .await?;
-
-            sqlx::query(
-                "INSERT OR IGNORE INTO cache_entry_tags (tag, key_digest) VALUES (?, ?)"
-            )
-            .bind(tag.as_str())
-            .bind(&key_digest)
-            .execute(&self.pool)
-            .await?;
+            insert_tag_link_pool(&self.pool, &key_digest, tag).await?;
         }
+
+        Ok(())
+    }
+
+    /// Explicitly replace all tags for a cache entry.
+    ///
+    /// This is intentionally separate from [`SqliteCache::put`] because most
+    /// crawler writes should merge tags. Replacing tags is destructive and may
+    /// remove associations created by other seeds, entities, categories, or runs.
+    pub async fn replace_tags(
+        &self,
+        key: &CacheKey,
+        tags: &[CacheTag],
+    ) -> CacheResult<()> {
+        let key_digest = cache_key_digest(key)?;
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM cache_entry_tags WHERE key_digest = ?")
+            .bind(&key_digest)
+            .execute(&mut *tx)
+            .await?;
+
+        for tag in tags {
+            insert_tag_link_tx(&mut tx, &key_digest, tag).await?;
+        }
+
+        tx.commit().await?;
+
         Ok(())
     }
 
@@ -427,49 +574,118 @@ impl SqliteCache {
 
         for tag in tags {
             sqlx::query(
-                "DELETE FROM cache_entry_tags WHERE key_digest = ? AND tag = ?"
+                r#"
+                DELETE FROM cache_entry_tags
+                WHERE key_digest = ?
+                  AND tag_kind = ?
+                  AND tag_key = ?
+                "#,
             )
             .bind(&key_digest)
-            .bind(tag.as_str())
+            .bind(tag.kind())
+            .bind(tag.key())
             .execute(&self.pool)
             .await?;
         }
+
         Ok(())
     }
 
-    /// Delete all entries (and their payloads + auxiliary data) that carry the given tag.
-    /// Returns the number of entries deleted.
+    /// Remove all tags from a cache entry.
+    pub async fn clear_tags(&self, key: &CacheKey) -> CacheResult<u64> {
+        let key_digest = cache_key_digest(key)?;
+
+        let result = sqlx::query(
+            "DELETE FROM cache_entry_tags WHERE key_digest = ?",
+        )
+        .bind(&key_digest)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Delete all entries carrying the given exact tag.
+    ///
+    /// Payloads, auxiliary values, and tag links are removed by cascading foreign
+    /// keys.
     pub async fn delete_entries_by_tag(&self, tag: &CacheTag) -> CacheResult<u64> {
         let result = sqlx::query(
             r#"
             DELETE FROM cache_entries
             WHERE key_digest IN (
-                SELECT key_digest FROM cache_entry_tags WHERE tag = ?
+                SELECT key_digest
+                FROM cache_entry_tags
+                WHERE tag_kind = ?
+                  AND tag_key = ?
             )
             "#,
         )
-        .bind(tag.as_str())
+        .bind(tag.kind())
+        .bind(tag.key())
         .execute(&self.pool)
         .await?;
 
         Ok(result.rows_affected())
     }
 
-    /// Remove the given tag from every entry that currently has it.
-    /// The entries themselves are left intact. Returns number of tag links removed.
+    /// Delete all entries carrying any tag of the given kind.
+    ///
+    /// Example: delete all entries tagged with any `run` tag.
+    pub async fn delete_entries_by_tag_kind(&self, kind: &str) -> CacheResult<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM cache_entries
+            WHERE key_digest IN (
+                SELECT key_digest
+                FROM cache_entry_tags
+                WHERE tag_kind = ?
+            )
+            "#,
+        )
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Remove the given exact tag from every entry.
+    ///
+    /// Entries are left intact. Returns the number of tag links removed.
     pub async fn remove_tag_from_all(&self, tag: &CacheTag) -> CacheResult<u64> {
         let result = sqlx::query(
-            "DELETE FROM cache_entry_tags WHERE tag = ?"
+            r#"
+            DELETE FROM cache_entry_tags
+            WHERE tag_kind = ?
+              AND tag_key = ?
+            "#,
         )
-        .bind(tag.as_str())
+        .bind(tag.kind())
+        .bind(tag.key())
         .execute(&self.pool)
         .await?;
 
         Ok(result.rows_affected())
     }
 
-    /// List lightweight references for all entries carrying the given tag.
-    /// Does not load payloads (use `get` for full entries).
+    /// Remove all tag links of a given kind from every entry.
+    ///
+    /// Example: remove all `run` links while preserving `entity` and `category`.
+    pub async fn remove_tag_kind_from_all(&self, kind: &str) -> CacheResult<u64> {
+        let result = sqlx::query(
+            "DELETE FROM cache_entry_tags WHERE tag_kind = ?",
+        )
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// List lightweight references for entries carrying an exact tag.
+    ///
+    /// Does not load payloads. Use [`SqliteCache::get`] for full entries.
     pub async fn list_by_tag(&self, tag: &CacheTag) -> CacheResult<Vec<CacheEntryRef>> {
         let rows = sqlx::query(
             r#"
@@ -485,52 +701,113 @@ impl SqliteCache {
                 e.content_type
             FROM cache_entries e
             JOIN cache_entry_tags t ON t.key_digest = e.key_digest
-            WHERE t.tag = ?
+            WHERE t.tag_kind = ?
+              AND t.tag_key = ?
             ORDER BY e.stored_at_unix_ms DESC
             "#,
         )
-        .bind(tag.as_str())
+        .bind(tag.kind())
+        .bind(tag.key())
         .fetch_all(&self.pool)
         .await?;
 
-        let mut refs = Vec::new();
-        for row in rows {
-            let key_json: String = row.try_get("key_json")?;
-            let key: CacheKey = serde_json::from_str(&key_json)
-                .map_err(|e| CacheError::Json(e.to_string()))?;
+        rows_to_entry_refs(rows)
+    }
 
-            refs.push(CacheEntryRef {
-                key_digest: row.try_get("key_digest")?,
-                key,
-                requested_url: row.try_get("requested_url")?,
-                final_url: row.try_get("final_url")?,
-                stored_at_unix_ms: row.try_get("stored_at_unix_ms")?,
-                entry_kind: row.try_get("entry_kind")?,
-                metadata_version: row.try_get::<i64, _>("metadata_version")? as u32,
-                status_code: row
-                    .try_get::<Option<i64>, _>("status_code")?
-                    .map(|c| c as u16),
-                content_type: row.try_get("content_type")?,
-            });
+    /// List lightweight references for entries carrying any tag of a kind.
+    ///
+    /// Example queries:
+    ///
+    /// - all pages associated with any entity,
+    /// - all pages associated with any category,
+    /// - all pages produced by any run tag.
+    pub async fn list_by_tag_kind(&self, kind: &str) -> CacheResult<Vec<CacheEntryRef>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT
+                e.key_digest,
+                e.key_json,
+                e.requested_url,
+                e.final_url,
+                e.stored_at_unix_ms,
+                e.entry_kind,
+                e.metadata_version,
+                e.status_code,
+                e.content_type
+            FROM cache_entries e
+            JOIN cache_entry_tags t ON t.key_digest = e.key_digest
+            WHERE t.tag_kind = ?
+            ORDER BY e.stored_at_unix_ms DESC
+            "#,
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows_to_entry_refs(rows)
+    }
+
+    /// List all known tags of a given kind.
+    pub async fn list_tags_by_kind(&self, kind: &str) -> CacheResult<Vec<CacheTag>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tag_kind, tag_key
+            FROM cache_tags
+            WHERE tag_kind = ?
+            ORDER BY tag_key
+            "#,
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tags = Vec::new();
+
+        for row in rows {
+            let kind: String = row.try_get("tag_kind")?;
+            let key: String = row.try_get("tag_key")?;
+            tags.push(CacheTag::raw(kind, key));
         }
-        Ok(refs)
+
+        Ok(tags)
+    }
+
+    /// List every tag currently attached to a cache entry.
+    pub async fn list_tags_for_entry(&self, key: &CacheKey) -> CacheResult<Vec<CacheTag>> {
+        let key_digest = cache_key_digest(key)?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT tag_kind, tag_key
+            FROM cache_entry_tags
+            WHERE key_digest = ?
+            ORDER BY tag_kind, tag_key
+            "#,
+        )
+        .bind(&key_digest)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tags = Vec::new();
+
+        for row in rows {
+            let kind: String = row.try_get("tag_kind")?;
+            let key: String = row.try_get("tag_key")?;
+            tags.push(CacheTag::raw(kind, key));
+        }
+
+        Ok(tags)
     }
 }
-
 
 // ————————————————————————————————————————————————————————————————————————————
 // Auxiliary Key/Value Storage
 // ————————————————————————————————————————————————————————————————————————————
-//
-// This provides a flexible per-entry key/value store for derived/post-processed
-// data. It is intentionally separate from `CacheEntryMetadata` so that
-// downstream pipelines can evolve independently without touching core crawl data.
 
 impl SqliteCache {
-
     /// Retrieve an auxiliary value attached to a cache entry.
     ///
-    /// Returns `None` if the entry or the specific auxiliary key does not exist.
+    /// Returns `None` if the entry or auxiliary key does not exist.
     pub async fn get_auxiliary(
         &self,
         key: &CacheKey,
@@ -539,28 +816,27 @@ impl SqliteCache {
         let key_digest = cache_key_digest(key)?;
 
         let row = sqlx::query(
-            "SELECT value_json FROM cache_auxiliary WHERE key_digest = ? AND aux_key = ?"
+            "SELECT value_json FROM cache_auxiliary WHERE key_digest = ? AND aux_key = ?",
         )
         .bind(&key_digest)
         .bind(aux_key)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(row) => {
-                let json_str: String = row.try_get("value_json")?;
-                let value: serde_json::Value = serde_json::from_str(&json_str)
-                    .map_err(|e| CacheError::Json(e.to_string()))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let value_json: String = row.try_get("value_json")?;
+        let value = serde_json::from_str(&value_json)
+            .map_err(|e| CacheError::Json(e.to_string()))?;
+
+        Ok(Some(value))
     }
 
     /// Store or overwrite an auxiliary value for a cache entry.
     ///
-    /// The parent cache entry **must already exist** (created via `put`).
-    /// If the entry does not exist, this will fail due to the foreign key constraint.
+    /// The parent cache entry must already exist.
     pub async fn put_auxiliary(
         &self,
         key: &CacheKey,
@@ -594,25 +870,31 @@ impl SqliteCache {
         let key_digest = cache_key_digest(key)?;
 
         let rows = sqlx::query(
-            "SELECT aux_key FROM cache_auxiliary WHERE key_digest = ? ORDER BY aux_key"
+            "SELECT aux_key FROM cache_auxiliary WHERE key_digest = ? ORDER BY aux_key",
         )
         .bind(&key_digest)
         .fetch_all(&self.pool)
         .await?;
 
         let mut keys = Vec::new();
+
         for row in rows {
             keys.push(row.try_get("aux_key")?);
         }
+
         Ok(keys)
     }
 
     /// Delete a specific auxiliary key from a cache entry.
-    pub async fn delete_auxiliary(&self, key: &CacheKey, aux_key: &str) -> CacheResult<()> {
+    pub async fn delete_auxiliary(
+        &self,
+        key: &CacheKey,
+        aux_key: &str,
+    ) -> CacheResult<()> {
         let key_digest = cache_key_digest(key)?;
 
         sqlx::query(
-            "DELETE FROM cache_auxiliary WHERE key_digest = ? AND aux_key = ?"
+            "DELETE FROM cache_auxiliary WHERE key_digest = ? AND aux_key = ?",
         )
         .bind(&key_digest)
         .bind(aux_key)
@@ -623,4 +905,107 @@ impl SqliteCache {
     }
 }
 
+// ————————————————————————————————————————————————————————————————————————————
+// Helpers
+// ————————————————————————————————————————————————————————————————————————————
+
+async fn insert_tag_link_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    key_digest: &str,
+    tag: &CacheTag,
+) -> CacheResult<()> {
+    let compound = tag.as_compound();
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO cache_tags (
+            tag_kind, tag_key, tag
+        ) VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(tag.kind())
+    .bind(tag.key())
+    .bind(&compound)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO cache_entry_tags (
+            tag_kind, tag_key, tag, key_digest
+        ) VALUES (?, ?, ?, ?)
+        "#,
+    )
+    .bind(tag.kind())
+    .bind(tag.key())
+    .bind(&compound)
+    .bind(key_digest)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_tag_link_pool(
+    pool: &SqlitePool,
+    key_digest: &str,
+    tag: &CacheTag,
+) -> CacheResult<()> {
+    let compound = tag.as_compound();
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO cache_tags (
+            tag_kind, tag_key, tag
+        ) VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(tag.kind())
+    .bind(tag.key())
+    .bind(&compound)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO cache_entry_tags (
+            tag_kind, tag_key, tag, key_digest
+        ) VALUES (?, ?, ?, ?)
+        "#,
+    )
+    .bind(tag.kind())
+    .bind(tag.key())
+    .bind(&compound)
+    .bind(key_digest)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn rows_to_entry_refs(rows: Vec<SqliteRow>) -> CacheResult<Vec<CacheEntryRef>> {
+    let mut refs = Vec::new();
+
+    for row in rows {
+        let key_json: String = row.try_get("key_json")?;
+        let key: CacheKey = serde_json::from_str(&key_json)
+            .map_err(|e| CacheError::Json(e.to_string()))?;
+
+        refs.push(CacheEntryRef {
+            key_digest: row.try_get("key_digest")?,
+            key,
+            requested_url: row.try_get("requested_url")?,
+            final_url: row.try_get("final_url")?,
+            stored_at_unix_ms: row.try_get("stored_at_unix_ms")?,
+            entry_kind: row.try_get("entry_kind")?,
+            metadata_version: row.try_get::<i64, _>("metadata_version")? as u32,
+            status_code: row
+                .try_get::<Option<i64>, _>("status_code")?
+                .map(|code| code as u16),
+            content_type: row.try_get("content_type")?,
+        });
+    }
+
+    Ok(refs)
+}
 

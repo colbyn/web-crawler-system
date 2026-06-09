@@ -1,30 +1,82 @@
 //! Crawl run state.
 //!
-//! Owns the frontier, queued/visited tracking, result accumulation, and run
-//! limits. This keeps the main `crawl` loop clean and prevents it from becoming
-//! a junk drawer of mutable local variables.
+//! This module owns the mutable state for a single crawl invocation.
+//!
+//! It keeps the engine loop small by managing:
+//!
+//! - the frontier,
+//! - queued URL tracking,
+//! - visited URL tracking,
+//! - page result accumulation,
+//! - crawl limits,
+//! - expansion from discovered anchors.
+//!
+//! ## URL dedupe
+//!
+//! The state tracks normalized frontier/fetch keys so the same crawl run does
+//! not repeatedly visit equivalent URLs.
+//!
+//! This is intentionally run-local. Durable cross-run reuse belongs to the
+//! SQLite cache.
+//!
+//! ## Tag inheritance
+//!
+//! Seed/request tags must flow into discovered pages. This is what lets callers
+//! later query:
+//!
+//! ```text
+//! all cached pages reached for entity X
+//! all cached pages reached for category Y
+//! all cached pages reached during debug run Z
+//! ```
+//!
+//! This module therefore does not manually rebuild child requests field by
+//! field. It uses [`CrawlRequest::discovered_from`] so inheritance is centralized
+//! in the input model.
+//!
+//! The key invariant is:
+//!
+//! ```text
+//! parent request tags == child request inherited tags
+//! ```
+//!
+//! unless a future policy explicitly adds or removes tags.
 
 use std::collections::HashSet;
 
 use colored_json::Paint;
+use web_browser_driver::ExtractedAnchor;
 
 use crate::{
     config::CrawlLimits,
-    frontier::{FrontierItem, FrontierQueue},
+    frontier::{
+        FrontierItem,
+        FrontierQueue,
+    },
     input::CrawlRequest,
-    output::{CrawlPageResult, CrawlRunResult},
-    url::{NormalizedUrl, UrlNormalizer},
+    output::{
+        CrawlPageResult,
+        CrawlRunResult,
+    },
+    policy::{
+        CrawlPolicy,
+        ScopeDecision,
+    },
+    url::{
+        NormalizedUrl,
+        UrlNormalizer,
+    },
 };
 
 #[derive(Debug)]
 pub struct CrawlRunState<P> {
+    /// Candidate requests waiting to be visited.
     frontier: FrontierQueue<P>,
 
-    /// Normalized URLs already scheduled into the frontier.
+    /// Normalized URLs currently queued.
     ///
-    /// This prevents duplicate anchors on the same page, or across several
-    /// already-crawled pages, from flooding the frontier before the first copy
-    /// is visited.
+    /// This prevents the same normalized URL from being enqueued many times
+    /// before it is popped and visited.
     queued_fetch_keys: HashSet<NormalizedUrl>,
 
     /// Normalized URLs already popped and committed for crawl work.
@@ -36,6 +88,7 @@ pub struct CrawlRunState<P> {
     /// Results collected so far.
     pages: Vec<CrawlPageResult<P>>,
 
+    /// Run-local crawl limits.
     limits: CrawlLimits,
 }
 
@@ -72,7 +125,7 @@ where
         self.frontier.pop()
     }
 
-    /// Returns true if this normalized URL has already been visited / committed
+    /// Return true if this normalized URL has already been visited/committed
     /// for crawl work in the current run.
     pub fn has_visited_fetch_key(&self, request: &CrawlRequest<P>) -> bool {
         let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
@@ -84,11 +137,11 @@ where
         self.visited_fetch_keys.insert(identity.normalized);
     }
 
-    /// Attempts to enqueue a request.
+    /// Attempt to enqueue a request.
     ///
     /// Returns true when the request was actually added to the frontier.
-    /// Returns false when it was already queued, already visited, or the frontier
-    /// refused it because of capacity limits.
+    /// Returns false when it was already queued, already visited, or rejected
+    /// because the frontier is full.
     pub fn enqueue_request(&mut self, request: CrawlRequest<P>) -> bool {
         let identity = UrlNormalizer::normalize_for_frontier(&request.requested_url);
         let normalized = identity.normalized;
@@ -104,7 +157,7 @@ where
         if self.frontier.push(FrontierItem::new(request)) {
             true
         } else {
-            // Roll back the queued marker if the frontier was full.
+            // Roll back the queued marker if the frontier refused the item.
             self.queued_fetch_keys.remove(&normalized);
             false
         }
@@ -122,20 +175,22 @@ where
         CrawlRunResult { pages: self.pages }
     }
 
-    /// Expands the frontier from anchors discovered on a successfully crawled
+    /// Expand the frontier from anchors discovered on a successfully crawled
     /// page.
     ///
     /// Semantics:
-    /// - Only expands if still under `max_hop_depth`.
-    /// - Respects `ScopePolicy`.
-    /// - Avoids adding URLs already queued or visited in this run.
-    /// - Preserves provenance from the parent request.
-    /// - Sets `discovered_from` to the parent's requested URL.
+    ///
+    /// - only expands if still under `max_hop_depth`,
+    /// - respects scope policy,
+    /// - avoids URLs already queued or visited in this run,
+    /// - preserves seed/request context through `CrawlRequest::discovered_from`,
+    /// - sets `discovered_from` to the parent's requested URL,
+    /// - increments hop depth by one.
     pub fn expand_from_anchors(
         &mut self,
         parent: &CrawlRequest<P>,
-        anchors: &[web_browser_driver::ExtractedAnchor],
-        policy: &crate::policy::CrawlPolicy,
+        anchors: &[ExtractedAnchor],
+        policy: &CrawlPolicy,
     ) {
         let next_depth = parent.hop_depth + 1;
 
@@ -150,21 +205,12 @@ where
 
             if !matches!(
                 policy.evaluate_scope(&parent.seed_url, href),
-                crate::policy::ScopeDecision::InScope
+                ScopeDecision::InScope
             ) {
                 continue;
             }
 
-            let new_request = CrawlRequest {
-                id: crate::input::CrawlRequestId::new(),
-                seed_group_id: parent.seed_group_id,
-                seed_url: parent.seed_url.clone(),
-                requested_url: href.clone(),
-                discovered_from: Some(parent.requested_url.clone()),
-                hop_depth: next_depth,
-                profile_key: parent.profile_key.clone(),
-                provenance: parent.provenance.clone(),
-            };
+            let new_request = CrawlRequest::discovered_from(parent, href.clone());
 
             if self.enqueue_request(new_request) {
                 eprintln!(
@@ -181,3 +227,4 @@ where
         }
     }
 }
+

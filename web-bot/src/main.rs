@@ -20,11 +20,11 @@ struct Cli {
     command: Commands,
 
     /// Directory where browser profiles are stored
-    #[arg(long, default_value = "./output/web-bot/profiles")]
+    #[arg(long, default_value = ".output/web-bot/profiles")]
     profile_root: PathBuf,
 
     /// SQLite cache database path
-    #[arg(long, default_value = "./output/web-bot/db/cache.sqlite")]
+    #[arg(long, default_value = ".output/web-bot/db/cache.sqlite")]
     cache_db: PathBuf,
 }
 

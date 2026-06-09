@@ -1,52 +1,113 @@
 //! Crawl engine entry point.
 //!
-//! This module is the orchestration layer of the crawler. It is responsible for:
-//! - Managing the crawl frontier and run state
-//! - Coordinating browser sessions via `SessionPool` (with health-aware rotation)
-//! - Performing cache lookups with request-addressed keys
-//! - Executing live browser work when needed
-//! - Persisting self-contained `CachedPageArtifact`s
+//! This module is the orchestration layer of the crawler.
 //!
-//! The engine is intentionally generic over provenance (`P`) so that different
-//! callers can attach their own business metadata without polluting the crawler core.
+//! It coordinates:
+//!
+//! - crawl run state,
+//! - frontier scheduling,
+//! - visit policy,
+//! - browser session/profile assignment,
+//! - cache lookup,
+//! - live browser work,
+//! - artifact persistence,
+//! - sink callbacks,
+//! - frontier expansion.
+//!
+//! ## Cache and tag semantics
+//!
+//! The SQLite cache stores reusable page artifacts. A cache artifact is not the
+//! same thing as caller/application ownership.
+//!
+//! Multiple seeds, entities, categories, campaigns, or manual runs may point at
+//! the same cached artifact. Therefore request tags must be merged onto cache
+//! entries both:
+//!
+//! - when a live page is opened and saved,
+//! - when a page is served from cache.
+//!
+//! The second case is easy to miss. If a request hits an existing artifact and
+//! the engine does not merge the request tags, warm-cache crawls will fail to
+//! record new associations.
+//!
+//! The key invariant is:
+//!
+//! ```text
+//! seed/request tags flow downward through discovered pages
+//! and are merged onto every cache entry reached by those requests.
+//! ```
+//!
+//! ## Generic provenance lane
+//!
+//! The engine remains generic over `P`, but `P` is currently a phantom typed lane
+//! carried by request/result shapes. Durable caller association should happen via
+//! tags, not by trying to serialize arbitrary `P` into cache artifacts.
 
 use std::marker::PhantomData;
 
 use colored_json::Paint;
-use serde::{de::DeserializeOwned, Serialize};
-use web_browser_driver::{
-    AnchorExtractor, BrowserDriver, OpenPageOptions, PageInfoExtractor,
+use serde::{
+    de::DeserializeOwned,
+    Serialize,
 };
-
-
-
+use web_browser_driver::{
+    AnchorExtractor,
+    BrowserDriver,
+    OpenPageOptions,
+    PageInfoExtractor,
+};
 
 use crate::config::CrawlEngineConfig;
 use crate::error::CrawlEngineResult;
 use crate::input::CrawlRequest;
-use crate::output::{CrawlPageOutcome, CrawlPageResult, CrawlRunResult, SnapshotDecision};
-use crate::scheduler::{BrowserProfileAssignment, BrowserProfileStrategy, SessionScheduler};
+use crate::output::{
+    CrawlPageOutcome,
+    CrawlPageResult,
+    CrawlRunResult,
+    SnapshotDecision,
+};
+use crate::policy::{
+    CacheDecision,
+    CrawlPolicy,
+    VisitDecision,
+};
+use crate::scheduler::{
+    BrowserProfileAssignment,
+    BrowserProfileStrategy,
+    SessionScheduler,
+};
 use crate::sessions::SessionPool;
 use crate::state::CrawlRunState;
-use crate::store::{CrawlArtifactSink, NoopCrawlArtifactSink};
+use crate::store::{
+    CrawlArtifactSink,
+    NoopCrawlArtifactSink,
+};
 
-use crate::policy::{CacheDecision, CrawlPolicy, VisitDecision};
 use crate::sqlite_cache::{
-    CacheEntry, CacheEntryMetadata, CacheKey, CachePayload, CachePayloadCompression,
-    CachePayloadRole, SqliteCache,
+    CacheEntry,
+    CacheEntryMetadata,
+    CacheKey,
+    CachePayload,
+    CachePayloadCompression,
+    CachePayloadRole,
+    SqliteCache,
 };
 
 // ————————————————————————————————————————————————————————————————————————————
-// SMALL UTILS
+// Small utilities
 // ————————————————————————————————————————————————————————————————————————————
 
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
 
+/// Main crawler orchestration type.
+///
+/// `P` is retained as a typed lane for future caller-specific APIs. Current
+/// durable association should be expressed through `CrawlRequest::tags`.
 pub struct CrawlEngine<P, S = NoopCrawlArtifactSink> {
     pub config: CrawlEngineConfig,
     pub policy: CrawlPolicy,
@@ -85,13 +146,13 @@ where
     P: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
     S: CrawlArtifactSink<P> + Send + Sync,
 {
-    /// Attach a `SqliteCache`
+    /// Attach a SQLite cache.
     pub fn with_sqlite_cache(mut self, cache: SqliteCache) -> Self {
         self.sqlite_cache = Some(cache);
         self
     }
 
-    /// Remove any attached cache
+    /// Remove any attached cache.
     pub fn without_cache(mut self) -> Self {
         self.sqlite_cache = None;
         self
@@ -110,8 +171,12 @@ where
         }
     }
 
-    /// Attempts to serve a request from the cache.
+    /// Attempt to serve a request from cache.
+    ///
     /// Returns `Some(result)` only if a usable cached artifact was found.
+    ///
+    /// Important: cache hits still merge request tags onto the cache entry. This
+    /// preserves new caller associations even when no live browser work occurs.
     async fn try_cache(
         &self,
         request: &CrawlRequest<P>,
@@ -133,6 +198,14 @@ where
 
         if !matches!(decision, CacheDecision::Use) {
             return Ok(None);
+        }
+
+        // Cache hit association write.
+        //
+        // If a second seed/entity/category reaches an already-cached artifact,
+        // the artifact must still gain that request's tags.
+        if !request.tags.is_empty() {
+            cache.tag(cache_key, &request.tags).await?;
         }
 
         let Some(primary) = entry.metadata.primary_payload() else {
@@ -175,7 +248,7 @@ where
             .metadata
             .non_critical_errors_json
             .iter()
-            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect();
 
         let Some(resolution) = resolution else {
@@ -211,24 +284,28 @@ where
         }))
     }
 
-    pub async fn crawl(&self, seeds: Vec<CrawlRequest<P>>) -> CrawlEngineResult<CrawlRunResult<P>> {
+    pub async fn crawl(
+        &self,
+        seeds: Vec<CrawlRequest<P>>,
+    ) -> CrawlEngineResult<CrawlRunResult<P>> {
         let mut state = CrawlRunState::new(self.config.limits.clone(), seeds);
 
         // Session pool with health-aware + page-count rotation.
-        // Rotation is critical for long-running batch crawls to prevent
-        // memory leaks, CDP degradation, and profile contamination.
+        //
+        // Rotation is important for long-running batch crawls to prevent memory
+        // leaks, CDP degradation, and profile contamination.
         let mut sessions = SessionPool::new(
             &self.browser_driver,
             self.profile_strategy.clone(),
             self.profile_root.clone(),
-            150, // pages per session before proactive rotation
+            150,
         )
         .with_rotation_callback(|profile_key, reason| {
             tracing::info!(
                 target: "crawler::session",
                 profile_key = profile_key,
                 reason = ?reason,
-                "Browser session rotated"
+                "browser session rotated"
             );
         });
 
@@ -236,6 +313,7 @@ where
             let Some(item) = state.pop_next() else {
                 break;
             };
+
             let request = item.request;
 
             if state.has_visited_fetch_key(&request) {
@@ -247,6 +325,7 @@ where
 
             match self.policy.evaluate_visit(&request, &self.config.limits) {
                 VisitDecision::Visit => {}
+
                 VisitDecision::Skip { reason } => {
                     let result = CrawlPageResult {
                         request,
@@ -254,6 +333,7 @@ where
                         cache_decision: None,
                         outcome: CrawlPageOutcome::Skipped { reason },
                     };
+
                     self.sink.record_page(&result).await?;
                     state.record_page(result);
                     continue;
@@ -271,9 +351,8 @@ where
 
             // Fast path: try cache before acquiring a browser session.
             //
-            // Important: a cache hit should behave like replayed page evidence.
-            // Cached artifacts contain extracted anchors, so they must still expand
-            // the frontier; otherwise warm-cache crawls stop at the seed page.
+            // A cache hit behaves like replayed page evidence. Cached artifacts
+            // contain extracted anchors, so they still expand the frontier.
             if let Some(cached_result) = self.try_cache(&request, &cache_key).await? {
                 self.sink.record_page(&cached_result).await?;
                 state.record_page(cached_result.clone());
@@ -285,9 +364,10 @@ where
                 continue;
             }
 
-            // Live path
+            // Live path.
             let session = match sessions.get_or_start(&request).await {
-                Ok(s) => s,
+                Ok(session) => session,
+
                 Err(err) => {
                     let result = CrawlPageResult {
                         request,
@@ -299,6 +379,7 @@ where
                             should_terminate_session: true,
                         },
                     };
+
                     self.sink.record_page(&result).await?;
                     state.record_page(result);
                     continue;
@@ -319,27 +400,28 @@ where
                 sessions.terminate_for_request(&request).await;
             }
 
-            // Record the result
             self.sink.record_page(&result).await?;
             state.record_page(result.clone());
 
-            // === CRITICAL: Expand frontier from discovered anchors ===
             if let CrawlPageOutcome::Opened { anchors, .. } = &result.outcome {
                 state.expand_from_anchors(&request, anchors, &self.policy);
             }
         }
 
         sessions.shutdown_all().await;
+
         Ok(state.finish())
     }
 
-    /// Executes a live browser crawl for a single frontier item.
+    /// Execute a live browser crawl for a single frontier item.
     ///
     /// Responsibilities:
-    /// - Open the page using the provided session
-    /// - Perform generic extraction (PageInfo + Anchors)
-    /// - Capture HTML snapshot when configured
-    /// - Persist a self-contained `CachedPageArtifact`
+    ///
+    /// - open the page using the assigned browser session,
+    /// - perform generic extraction,
+    /// - capture HTML snapshot if configured,
+    /// - persist a SQLite cache entry,
+    /// - merge request tags onto the cache entry.
     async fn crawl_live_page(
         &self,
         request: &CrawlRequest<P>,
@@ -347,17 +429,17 @@ where
         assignment: BrowserProfileAssignment,
         session: &mut web_browser_driver::BrowserSession,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
-        {
-            eprintln!("{}", format!(
-                "🌐 {}",
-                request.requested_url.as_str().magenta(),
-            ).cyan());
-        }
+        eprintln!(
+            "{}",
+            format!("🌐 {}", request.requested_url.as_str().magenta()).cyan()
+        );
+
         let mut open_options = OpenPageOptions::new(request.requested_url.clone());
         open_options.timeout = Some(self.config.page_open_timeout);
 
         let opened = match session.open_page(open_options).await {
             Ok(opened) => opened,
+
             Err(err) => {
                 return Ok(CrawlPageResult {
                     request: request.clone(),
@@ -373,7 +455,9 @@ where
         };
 
         let page_info = PageInfoExtractor::extract(&opened.page).await.ok();
-        let anchors = AnchorExtractor::extract(&opened.page).await.unwrap_or_default();
+        let anchors = AnchorExtractor::extract(&opened.page)
+            .await
+            .unwrap_or_default();
 
         let html = if self.policy.snapshot.capture_html {
             opened.page.html().await.ok()
@@ -389,13 +473,15 @@ where
         }
 
         let snapshot = match &html {
-            Some(h) => SnapshotDecision::Captured {
-                html_bytes: h.len(),
-                body_sha256_hex: crate::sqlite_cache::model::sha256_hex(h.as_bytes()),
+            Some(html) => SnapshotDecision::Captured {
+                html_bytes: html.len(),
+                body_sha256_hex: crate::sqlite_cache::model::sha256_hex(html.as_bytes()),
             },
+
             None if self.policy.snapshot.capture_html => SnapshotDecision::Rejected {
                 reason: "failed to capture HTML".into(),
             },
+
             None => SnapshotDecision::NotRequested,
         };
 
@@ -414,12 +500,14 @@ where
             },
         };
 
-        // Persist artifact if HTML was captured and caching is enabled
-        // === Save to new SqliteCache if enabled ===
+        // Save to SQLite if HTML was captured and caching is enabled.
+        //
+        // Request tags are persisted here. `SqliteCache::put` must merge them
+        // with any existing tags for this cache entry.
         if self.config.cache_enabled {
             if let Some(cache) = &self.sqlite_cache {
-                if let Some(html_str) = html {
-                    let body = html_str.into_bytes();
+                if let Some(html) = html {
+                    let body = html.into_bytes();
                     let now_ms = now_unix_ms();
 
                     let snapshot_payload = CachePayload::new(
@@ -441,8 +529,12 @@ where
                         },
                         crate::sqlite_cache::CacheRequestInfo {
                             requested_url: request.requested_url.to_string(),
-                            requested_host: request.requested_url.host_str().map(|s| s.to_string()),
-                            profile_key_json: serde_json::to_value(&assignment.key).unwrap_or_default(),
+                            requested_host: request
+                                .requested_url
+                                .host_str()
+                                .map(|host| host.to_string()),
+                            profile_key_json: serde_json::to_value(&assignment.key)
+                                .unwrap_or_default(),
                             namespace: None,
                         },
                         crate::sqlite_cache::CacheResponseInfo {
@@ -451,7 +543,7 @@ where
                                 .resolution
                                 .final_url
                                 .host_str()
-                                .map(|s| s.to_string()),
+                                .map(|host| host.to_string()),
                             status_code: opened.status_code,
                             content_type: Some("text/html".to_string()),
                         },
@@ -470,28 +562,30 @@ where
                     metadata.non_critical_errors_json = opened
                         .non_critical_errors
                         .iter()
-                        .filter_map(|e| serde_json::to_value(e).ok())
+                        .filter_map(|error| serde_json::to_value(error).ok())
                         .collect();
 
                     let cache_entry = CacheEntry {
                         metadata,
                         payloads: vec![snapshot_payload],
-                        tags: vec![],
+                        tags: request.tags.clone(),
                     };
-                    
+
                     match cache.put(&cache_entry).await {
                         Ok(()) => {
                             tracing::debug!(
                                 requested_url = %request.requested_url,
                                 key_digest = %crate::sqlite_cache::cache_key_digest(&cache_key)
                                     .unwrap_or_else(|_| "<digest-error>".into()),
+                                tag_count = request.tags.len(),
                                 "saved sqlite cache entry"
                             );
                         }
-                        Err(e) => {
+
+                        Err(err) => {
                             tracing::warn!(
                                 requested_url = %request.requested_url,
-                                error = %e,
+                                error = %err,
                                 "failed to save sqlite cache entry"
                             );
                         }
@@ -501,8 +595,8 @@ where
         }
 
         let _ = opened.page.close().await;
+
         Ok(result)
     }
 }
-
 
