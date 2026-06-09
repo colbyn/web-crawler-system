@@ -419,8 +419,8 @@ web-bot cache list-tags-by-kind entity
 
 | Scope            | Flag                          | Description                               | Default                            |
 | ---------------- | ----------------------------- | ----------------------------------------- | ---------------------------------- |
-| Global           | `--profile-root`              | Browser profile directory                 | `./output/web-bot/profiles`        |
-| Global           | `--cache-db`                  | SQLite cache database path                | `./output/web-bot/db/cache.sqlite` |
+| Global           | `--profile-root`              | Browser profile directory                 | `.output/web-bot/profiles`        |
+| Global           | `--cache-db`                  | SQLite cache database path                | `.output/web-bot/db/cache.sqlite` |
 | `crawl`          | `--format`                    | Input format: `text`, `ndjson`, or `json` | `text`                             |
 | `crawl`          | `--url-pointer`               | JSON Pointer to extract URL               | none                               |
 | `crawl`          | `--tag kind:key`              | Attach global tag to every seed           | none                               |
