@@ -3,6 +3,7 @@
         "chromiumoxide",
         "Colbyn",
         "Deque",
+        "hvac",
         "indexmap",
         "navigations",
         "persistable",
