@@ -64,14 +64,28 @@
 //! - lease browser page capacity,
 //! - open/extract/snapshot,
 //! - save cache,
+//! - close the page on a short best-effort timeout,
 //! - return one `CrawlPageResult`.
 //!
 //! This keeps the mutable crawl brain in one place while browser/page work runs
 //! concurrently.
+//!
+//! ## Timeout safety
+//!
+//! Browser automation cleanup is not allowed to hold the crawl hostage.
+//!
+//! A live page crawl is wrapped in a crawler-level timeout. Individual browser
+//! operations may have lower-level timeouts, but this outer envelope guarantees a
+//! worker eventually returns a page result.
+//!
+//! Page close is also treated as best-effort cleanup. If Chrome/CDP wedges while
+//! closing a tab, the crawler records the page result and lets session health
+//! policy decide whether that browser session should be retired.
 
 use std::{
     marker::PhantomData,
     sync::Arc,
+    time::Duration,
 };
 
 use colored_json::Paint;
@@ -459,7 +473,7 @@ where
     ///
     /// - try cache,
     /// - if cache misses, lease browser page capacity,
-    /// - open/extract/snapshot live page,
+    /// - open/extract/snapshot live page under a hard crawler timeout,
     /// - save cache,
     /// - return exactly one page result.
     async fn crawl_one_request(
@@ -497,9 +511,49 @@ where
 
         let session = lease.session();
 
-        let result = self
-            .crawl_live_page(&request, cache_key, assignment, session)
-            .await?;
+        let page_timeout = self.config.page_open_timeout;
+        let requested_url = request.requested_url.clone();
+
+        let result = match tokio::time::timeout(
+            page_timeout,
+            self.crawl_live_page(
+                &request,
+                cache_key.clone(),
+                assignment,
+                session,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+
+            Err(_) => {
+                tracing::warn!(
+                    requested_url = %requested_url,
+                    timeout_ms = page_timeout.as_millis(),
+                    "page crawl timed out"
+                );
+
+                CrawlPageResult {
+                    request: request.clone(),
+                    cache_key: Some(cache_key),
+                    cache_decision: None,
+                    outcome: CrawlPageOutcome::Failed {
+                        error: format!(
+                            "page crawl timed out after {}ms",
+                            page_timeout.as_millis()
+                        ),
+                        retryable: true,
+                        should_terminate_session: true,
+                    },
+                }
+            }
+        };
+
+        tracing::debug!(
+            requested_url = %requested_url,
+            "page crawl task completed"
+        );
 
         if matches!(
             &result.outcome,
@@ -522,7 +576,8 @@ where
     /// - perform generic extraction,
     /// - capture HTML snapshot if configured,
     /// - persist a SQLite cache entry,
-    /// - merge request tags onto the cache entry.
+    /// - merge request tags onto the cache entry,
+    /// - close the page on a short best-effort timeout.
     async fn crawl_live_page(
         &self,
         request: &CrawlRequest<P>,
@@ -696,9 +751,38 @@ where
             }
         }
 
-        let _ = opened.page.close().await;
+        let close_timeout = Duration::from_secs(3);
+
+        match tokio::time::timeout(close_timeout, opened.page.close()).await {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    requested_url = %request.requested_url,
+                    "page close finished"
+                );
+            }
+
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    requested_url = %request.requested_url,
+                    error = %err,
+                    "page close failed"
+                );
+            }
+
+            Err(_) => {
+                tracing::warn!(
+                    requested_url = %request.requested_url,
+                    timeout_ms = close_timeout.as_millis(),
+                    "page close timed out; continuing crawl"
+                );
+            }
+        }
+
+        tracing::debug!(
+            requested_url = %request.requested_url,
+            "live page crawl returning result"
+        );
 
         Ok(result)
     }
 }
-

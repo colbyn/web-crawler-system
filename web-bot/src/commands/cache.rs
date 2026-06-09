@@ -169,7 +169,8 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
             json,
             full,
         } => {
-            lookup_metadata(&cache, &url, &profile_key, namespace, json, full).await?;
+            let _ = profile_key;
+            lookup_metadata(&cache, &url, namespace, json, full).await?;
         }
 
         CacheCommands::Snapshot {
@@ -178,7 +179,8 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
             namespace,
             output,
         } => {
-            get_snapshot(&cache, &url, &profile_key, namespace, output).await?;
+            let _ = profile_key;
+            get_snapshot(&cache, &url, namespace, output).await?;
         }
 
         CacheCommands::Remove {
@@ -187,7 +189,8 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
             namespace,
             force,
         } => {
-            remove_url(&cache, &url, &profile_key, namespace, force).await?;
+            let _ = profile_key;
+            remove_url(&cache, &url, namespace, force).await?;
         }
 
         CacheCommands::Clear { force } => {
@@ -204,7 +207,8 @@ pub async fn run(action: CacheCommands, cache_db: &PathBuf) -> anyhow::Result<()
             namespace,
             tags,
         } => {
-            tag_url(&cache, &url, &profile_key, namespace, tags).await?;
+            let _ = profile_key;
+            tag_url(&cache, &url, namespace, tags).await?;
         }
 
         CacheCommands::ListByTag { tag, json } => {
@@ -270,7 +274,7 @@ fn primary_payload(entry: &CacheEntry) -> Option<&CachePayload> {
 async fn lookup_metadata(
     cache: &SqliteCache,
     url: &str,
-    profile_key: &str,
+    // profile_key: &str,
     namespace: Option<String>,
     json: bool,
     full: bool,
@@ -377,7 +381,7 @@ async fn lookup_metadata(
 async fn get_snapshot(
     cache: &SqliteCache,
     url: &str,
-    profile_key: &str,
+    // profile_key: &str,
     namespace: Option<String>,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -411,7 +415,7 @@ async fn get_snapshot(
 async fn remove_url(
     cache: &SqliteCache,
     url: &str,
-    profile_key: &str,
+    // profile_key: &str,
     namespace: Option<String>,
     force: bool,
 ) -> anyhow::Result<()> {
@@ -555,7 +559,7 @@ async fn show_stats(
 async fn tag_url(
     cache: &SqliteCache,
     url: &str,
-    profile_key: &str,
+    // profile_key: &str,
     namespace: Option<String>,
     tags: Vec<String>,
 ) -> anyhow::Result<()> {
