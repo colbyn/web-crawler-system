@@ -555,6 +555,30 @@ where
             "page crawl task completed"
         );
 
+        if let CrawlPageOutcome::Failed {
+            error,
+            retryable,
+            should_terminate_session,
+        } = &result.outcome
+        {
+            tracing::warn!(
+                requested_url = %requested_url,
+                error = %error,
+                retryable = *retryable,
+                should_terminate_session = *should_terminate_session,
+                "page crawl failed"
+            );
+
+            eprintln!(
+                "{}",
+                format!(
+                    "❌ {} | retryable={} terminate_session={} | {}",
+                    requested_url, retryable, should_terminate_session, error
+                )
+                .red()
+            );
+        }
+
         if matches!(
             &result.outcome,
             CrawlPageOutcome::Failed {
@@ -591,7 +615,11 @@ where
         );
 
         let mut open_options = OpenPageOptions::new(request.requested_url.clone());
-        open_options.timeout = Some(self.config.page_open_timeout);
+
+        // The engine already wraps the whole live page crawl in page_open_timeout.
+        // Do not apply the exact same timeout again inside the browser open call,
+        // or slow-but-scrapeable pages get killed twice by the same clock.
+        open_options.timeout = None;
 
         let opened = match session.open_page(open_options).await {
             Ok(opened) => opened,
