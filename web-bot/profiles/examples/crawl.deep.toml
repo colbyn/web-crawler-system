@@ -1,0 +1,41 @@
+# Deep crawl profile.
+#
+# Use when discovering internal site pages matters more than raw throughput.
+#
+# web-bot crawl --config web-bot/config/crawl.deep.toml -i https://example.com
+#
+
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:deep"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 100
+total-pages = 1000
+depth = 3
+frontier-items = 250000
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+cache-jobs = 32
+rotate = 100
+timeout-secs = 60
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

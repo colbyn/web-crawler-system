@@ -2,6 +2,15 @@
 //!
 //! Provides commands to crawl content into a shared SQLite cache and inspect
 //! cached artifacts.
+//!
+//! The crawl command supports layered configuration:
+//!
+//! ```text
+//! explicit CLI argument > TOML config file > hardcoded default
+//! ```
+//!
+//! Crawl flags use `Option<T>` where needed, so the crawl module can distinguish
+//! user-provided overrides from defaults without keeping raw Clap matches alive.
 
 use clap::{
     Parser,

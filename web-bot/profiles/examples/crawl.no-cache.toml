@@ -1,0 +1,42 @@
+# No-cache crawl profile.
+#
+# Disables crawler SQLite cache lookup/storage.
+# Chromium's own browser-profile cache may still exist.
+#
+# web-bot crawl --config web-bot/config/crawl.no-cache.toml -i https://example.com
+#
+
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:no-cache"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 50
+depth = 1
+frontier-items = 10000
+
+[runtime]
+jobs = 4
+sessions = 2
+tabs = 2
+cache-jobs = 8
+rotate = 50
+timeout-secs = 60
+
+[profile]
+strategy = "single"
+key = "no-cache"
+
+[cache]
+enabled = false
+namespace = "default"

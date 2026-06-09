@@ -1,0 +1,47 @@
+# Batch entity crawl profile.
+#
+# Designed for NDJSON rows with a website URL and stable entity id.
+#
+# Example input row:
+# { "id": "business-123", "website": "https://example.com", "categories": ["electricians"] }
+#
+# cat businesses.ndjson | web-bot crawl --config web-bot/config/crawl.batch.toml
+#
+
+[input]
+urls = ["-"]
+format = "ndjson"
+url-pointer = "/website"
+attach-provenance = false
+
+[tags]
+global = ["run:batch"]
+pointers = [
+  "entity=/id",
+  "category=/categories"
+]
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 5000
+depth = 1
+frontier-items = 100000
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+cache-jobs = 32
+rotate = 150
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

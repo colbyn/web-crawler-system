@@ -1,0 +1,48 @@
+# NDJSON output profile.
+#
+# Emits one crawl page result per stdout line.
+# Human diagnostics should stay on stderr.
+#
+# ```bash
+# cat businesses.ndjson \
+#   | web-bot crawl --config web-bot/config/crawl.ndjson-output.toml \
+#   > crawl-results.ndjson
+# ```
+
+[input]
+urls = ["-"]
+format = "ndjson"
+url-pointer = "/website"
+attach-provenance = false
+
+[tags]
+global = ["run:ndjson-output"]
+pointers = [
+  "entity=/id",
+  "category=/categories"
+]
+
+[output]
+format = "ndjson"
+
+[budget]
+pages = 10
+total-pages = 5000
+depth = 1
+frontier-items = 100000
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+cache-jobs = 32
+rotate = 150
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

@@ -1,0 +1,42 @@
+# Debug crawl profile.
+#
+# Conservative runtime settings make behavior easier to inspect.
+# Pair with RUST_LOG=debug when needed.
+#
+# RUST_LOG=debug web-bot crawl --config web-bot/config/crawl.debug.toml -i https://example.com
+
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:debug"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 20
+total-pages = 20
+depth = 1
+frontier-items = 5000
+
+[runtime]
+jobs = 1
+sessions = 1
+tabs = 1
+cache-jobs = 4
+rotate = 25
+timeout-secs = 60
+
+[profile]
+strategy = "single"
+key = "debug"
+
+[cache]
+enabled = true
+namespace = "debug"
+

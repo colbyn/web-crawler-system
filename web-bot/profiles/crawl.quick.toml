@@ -1,0 +1,41 @@
+# Quick crawl profile.
+#
+# Good for manual checks, smoke tests, and small one-off crawls.
+#
+# web-bot crawl --config web-bot/config/crawl.quick.toml -i https://example.com
+#
+
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:quick"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 50
+depth = 1
+frontier-items = 10000
+
+[runtime]
+jobs = 4
+sessions = 2
+tabs = 2
+cache-jobs = 16
+rotate = 100
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

@@ -22,6 +22,8 @@ Tags are the durable association mechanism. A cached artifact is one thing; the 
 * Global seed tags via `--tag kind:key`
 * JSON-derived seed tags via `--tag-pointer kind=/json/pointer`
 * Tag inheritance from seed pages to discovered pages
+* Unified CLI/config vocabulary
+* Reusable TOML crawl profiles
 * SQLite-backed cache storage
 * HTML snapshot inspection and export
 * Cache management: lookup, snapshot, remove, clear, stats
@@ -45,13 +47,13 @@ target/release/web-bot
 
 | Flag                    | Description                                 | Default                            |
 | ----------------------- | ------------------------------------------- | ---------------------------------- |
-| `--profile-root <path>` | Directory where browser profiles are stored | `./output/web-bot/profiles`        |
-| `--cache-db <path>`     | SQLite cache database path                  | `./output/web-bot/db/cache.sqlite` |
+| `--profile-root <path>` | Directory where browser profiles are stored | `.output/web-bot/profiles`         |
+| `--cache-db <path>`     | SQLite cache database path                  | `.output/web-bot/db/cache.sqlite`  |
 
 Global options go before the subcommand:
 
 ```bash
-web-bot --cache-db ./output/web-bot/db/cache.sqlite crawl -i https://example.com
+web-bot --cache-db .output/web-bot/db/cache.sqlite crawl -i https://example.com
 ```
 
 ## Commands
@@ -68,6 +70,66 @@ web-bot --cache-db ./output/web-bot/db/cache.sqlite crawl -i https://example.com
 | `cache list-by-tag <tag>`        | List cache entries by exact tag               |
 | `cache list-by-tag-kind <kind>`  | List cache entries carrying any tag of a kind |
 | `cache list-tags-by-kind <kind>` | List known tags of a kind                     |
+
+## Design: One Vocabulary, Two Shapes
+
+`web-bot crawl` exposes the same concepts through CLI flags and TOML settings.
+
+TOML is nested and reusable:
+
+```toml
+[budget]
+pages = 20
+depth = 1
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+```
+
+CLI is flattened and convenient:
+
+```bash
+web-bot crawl \
+  -i https://example.com \
+  --pages 20 \
+  --depth 1 \
+  --jobs 8 \
+  --sessions 4 \
+  --tabs 2
+```
+
+The leaf names match wherever practical:
+
+| TOML setting              | CLI flag              |
+| ------------------------- | --------------------- |
+| `[input].urls`            | `-i`, `--input`       |
+| `[input].format`          | `--format`            |
+| `[input].url-pointer`     | `--url-pointer`       |
+| `[tags].global`           | `--tag`               |
+| `[tags].pointers`         | `--tag-pointer`       |
+| `[output].format`         | `--output`            |
+| `[budget].pages`          | `--pages`             |
+| `[budget].total-pages`    | `--total-pages`       |
+| `[budget].depth`          | `--depth`             |
+| `[budget].frontier-items` | `--frontier-items`    |
+| `[runtime].jobs`          | `--jobs`              |
+| `[runtime].sessions`      | `--sessions`          |
+| `[runtime].tabs`          | `--tabs`              |
+| `[runtime].cache-jobs`    | `--cache-jobs`        |
+| `[runtime].rotate`        | `--rotate`            |
+| `[runtime].timeout-secs`  | `--timeout-secs`      |
+| `[profile].strategy`      | `--profile-strategy`  |
+| `[profile].key`           | `--profile`           |
+| `[cache].enabled`         | `--no-cache`          |
+| `[cache].namespace`       | `--namespace`         |
+
+CLI arguments override TOML settings. Repeated inputs and tags are additive: config values first, CLI values second.
+
+```text
+explicit CLI argument > TOML config file > hardcoded default
+```
 
 ## Tag Model
 
@@ -94,19 +156,19 @@ tag_kind = "entity"
 tag_key  = "business-123"
 ```
 
-This supports exact-tag lookup:
+Exact-tag lookup:
 
 ```bash
 web-bot cache list-by-tag entity:business-123
 ```
 
-and tag-kind lookup:
+Tag-kind lookup:
 
 ```bash
 web-bot cache list-by-tag-kind entity
 ```
 
-Tags attached to a seed are inherited by all discovered pages reached from that seed. This lets you ask:
+Tags attached to a seed are inherited by discovered pages reached from that seed. This lets downstream tools ask:
 
 ```text
 show me every cached page scraped for entity:business-123
@@ -142,21 +204,57 @@ or explicitly:
 cat urls.txt | web-bot crawl -i -
 ```
 
-### Crawl with limits
+### Crawl with budget limits
 
 ```bash
 web-bot crawl \
   -i https://example.com \
-  --max-pages 300 \
-  --max-depth 2
+  --pages 20 \
+  --depth 1 \
+  --total-pages 100
 ```
 
-| Flag              | Description                                 | Default |
-| ----------------- | ------------------------------------------- | ------- |
-| `--max-pages <n>` | Maximum pages to process                    | `50`    |
-| `--max-depth <n>` | Maximum crawl depth from each seed          | `1`     |
-| `--no-cache`      | Disable cache lookup/storage for this crawl | `false` |
-| `--json`          | Output crawl results as NDJSON              | `false` |
+| Flag                   | Description                                      | Default  |
+| ---------------------- | ------------------------------------------------ | -------- |
+| `--pages <n>`          | Maximum opened pages per seed                    | `10`     |
+| `--total-pages <n>`    | Optional global page budget for the whole crawl  | none     |
+| `--depth <n>`          | Maximum crawl depth from each seed               | `1`      |
+| `--frontier-items <n>` | Maximum URLs retained in the frontier            | `100000` |
+
+`--pages` is the primary crawl budget. It is per original seed. `--total-pages` is a global emergency brake across the whole invocation.
+
+### Crawl with runtime controls
+
+```bash
+web-bot crawl \
+  -i https://example.com \
+  --jobs 8 \
+  --sessions 4 \
+  --tabs 2 \
+  --rotate 150 \
+  --timeout-secs 45
+```
+
+| Flag                 | Description                                      | Default |
+| -------------------- | ------------------------------------------------ | ------- |
+| `--jobs <n>`         | Global in-flight page jobs                       | `8`     |
+| `--sessions <n>`     | Maximum live Chromium browser sessions           | `4`     |
+| `--tabs <n>`         | Maximum concurrent tabs/pages per browser        | `2`     |
+| `--cache-jobs <n>`   | Maximum concurrent cache operations              | `32`    |
+| `--rotate <n>`       | Rotate each browser session after this many pages| `150`   |
+| `--timeout-secs <n>` | Page open timeout in seconds                     | `45`    |
+
+A practical rule:
+
+```text
+jobs ≈ sessions × tabs
+```
+
+For example:
+
+```bash
+web-bot crawl -i https://example.com --sessions 4 --tabs 2 --jobs 8
+```
 
 ### Crawl with global tags
 
@@ -211,7 +309,7 @@ entity:business-123
 
 If the JSON pointer resolves to an array, each scalar item becomes a tag.
 
-Example:
+Input row:
 
 ```json
 {
@@ -237,18 +335,372 @@ category:electricians
 category:hvac
 ```
 
-### Deprecated provenance flag
+### Output formats
 
-`--attach-provenance` is currently ignored.
+Human output is the default:
 
-Use tags instead:
+```bash
+web-bot crawl -i https://example.com --output human
+```
+
+NDJSON output is useful for pipelines:
+
+```bash
+cat businesses.ndjson | web-bot crawl \
+  -i - \
+  --format ndjson \
+  --url-pointer /website \
+  --output ndjson \
+  > crawl-results.ndjson
+```
+
+`--json` is retained as a deprecated hidden alias for `--output ndjson`.
+
+### Cache controls
+
+Disable crawler SQLite cache lookup/storage:
+
+```bash
+web-bot crawl -i https://example.com --no-cache
+```
+
+This does not necessarily disable Chromium's own browser-profile cache.
+
+Set a cache namespace:
+
+```bash
+web-bot crawl -i https://example.com --namespace debug
+```
+
+Important: only document/use namespace operationally if the engine cache-key path honors it. The CLI and config can expose the setting, but namespace must be wired into cache-key creation to affect stored artifacts.
+
+### Profile strategy
 
 ```bash
 web-bot crawl \
-  --format ndjson \
-  --url-pointer /website \
-  --tag-pointer entity=/id \
-  --tag-pointer batch=/batch_id
+  -i https://example.com \
+  --profile-strategy by-seed-host \
+  --profile default
+```
+
+Supported strategies:
+
+| Strategy                    | Meaning                                                   |
+| --------------------------- | --------------------------------------------------------- |
+| `single`                    | Every request uses the configured fallback profile        |
+| `caller-provided-or-single` | Use caller-provided profile keys when available           |
+| `by-host`                   | Derive browser profile from requested URL host            |
+| `by-seed-host`              | Derive browser profile from original seed URL host        |
+
+Default:
+
+```text
+by-seed-host
+```
+
+## TOML Settings
+
+A crawl profile is a reusable TOML file passed with `--config`.
+
+```bash
+web-bot crawl --config web-bot/config/crawl.quick.toml -i https://example.com
+```
+
+Canonical settings format:
+
+```toml
+[input]
+urls = [
+  "https://books.toscrape.com",
+  "https://quotes.toscrape.com/js/"
+]
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:manual-debug"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 50
+depth = 1
+frontier-items = 100000
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+cache-jobs = 32
+rotate = 150
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"
+```
+
+### Recommended template profiles
+
+Suggested config directory:
+
+```text
+web-bot/config/
+  crawl.quick.toml
+  crawl.debug.toml
+  crawl.batch.toml
+  crawl.cache-warm.toml
+  crawl.low-resource.toml
+```
+
+### `crawl.quick.toml`
+
+Small manual crawl for smoke tests and one-off checks.
+
+```toml
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:quick"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 50
+depth = 1
+frontier-items = 10000
+
+[runtime]
+jobs = 4
+sessions = 2
+tabs = 2
+cache-jobs = 16
+rotate = 100
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"
+```
+
+Run:
+
+```bash
+web-bot crawl --config web-bot/config/crawl.quick.toml -i https://example.com
+```
+
+### `crawl.debug.toml`
+
+Conservative crawl for debugging correctness.
+
+```toml
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:debug"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 20
+total-pages = 20
+depth = 1
+frontier-items = 5000
+
+[runtime]
+jobs = 1
+sessions = 1
+tabs = 1
+cache-jobs = 4
+rotate = 25
+timeout-secs = 60
+
+[profile]
+strategy = "single"
+key = "debug"
+
+[cache]
+enabled = true
+namespace = "debug"
+```
+
+Run:
+
+```bash
+RUST_LOG=debug web-bot crawl \
+  --config web-bot/config/crawl.debug.toml \
+  -i https://example.com
+```
+
+### `crawl.batch.toml`
+
+Workhorse profile for NDJSON entity enrichment.
+
+```toml
+[input]
+urls = ["-"]
+format = "ndjson"
+url-pointer = "/website"
+attach-provenance = false
+
+[tags]
+global = ["run:batch"]
+pointers = [
+  "entity=/id",
+  "category=/categories"
+]
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 5000
+depth = 1
+frontier-items = 100000
+
+[runtime]
+jobs = 8
+sessions = 4
+tabs = 2
+cache-jobs = 32
+rotate = 150
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"
+```
+
+Run:
+
+```bash
+cat businesses.ndjson | web-bot crawl --config web-bot/config/crawl.batch.toml
+```
+
+### `crawl.cache-warm.toml`
+
+Shallow, broad crawl for preloading reusable page evidence.
+
+```toml
+[input]
+urls = ["-"]
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:cache-warm"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 3
+total-pages = 10000
+depth = 0
+frontier-items = 50000
+
+[runtime]
+jobs = 12
+sessions = 4
+tabs = 3
+cache-jobs = 64
+rotate = 250
+timeout-secs = 35
+
+[profile]
+strategy = "by-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"
+```
+
+Run:
+
+```bash
+cat urls.txt | web-bot crawl --config web-bot/config/crawl.cache-warm.toml
+```
+
+### `crawl.low-resource.toml`
+
+Laptop-friendly crawl profile.
+
+```toml
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:low-resource"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 100
+depth = 1
+frontier-items = 25000
+
+[runtime]
+jobs = 2
+sessions = 1
+tabs = 2
+cache-jobs = 8
+rotate = 50
+timeout-secs = 60
+
+[profile]
+strategy = "single"
+key = "low-resource"
+
+[cache]
+enabled = true
+namespace = "default"
+```
+
+Run:
+
+```bash
+web-bot crawl \
+  --config web-bot/config/crawl.low-resource.toml \
+  -i https://example.com
 ```
 
 ## Cache Operations
@@ -360,8 +812,8 @@ web-bot cache clear --force
 ```bash
 web-bot crawl \
   -i https://example.com \
-  --max-depth 1 \
-  --max-pages 20 \
+  --depth 1 \
+  --pages 20 \
   --tag run:manual-debug
 ```
 
@@ -380,14 +832,31 @@ cat electricians.ndjson | web-bot crawl \
   --url-pointer /website \
   --tag category:electricians \
   --tag-pointer entity=/id \
-  --max-depth 1 \
-  --max-pages 5000
+  --depth 1 \
+  --pages 10 \
+  --total-pages 5000
 ```
 
 Then list all cached pages associated with that category:
 
 ```bash
 web-bot cache list-by-tag category:electricians
+```
+
+### Warm cache first, tag later
+
+First prefetch URLs:
+
+```bash
+cat urls.txt | web-bot crawl \
+  --config web-bot/config/crawl.cache-warm.toml
+```
+
+Then run entity-tagged input later. Previously cached pages should be reused where cache keys match:
+
+```bash
+cat businesses.ndjson | web-bot crawl \
+  --config web-bot/config/crawl.batch.toml
 ```
 
 ### Inspect a specific cached page
@@ -417,24 +886,83 @@ web-bot cache list-tags-by-kind entity
 
 ## Configuration Summary
 
-| Scope            | Flag                          | Description                               | Default                            |
-| ---------------- | ----------------------------- | ----------------------------------------- | ---------------------------------- |
-| Global           | `--profile-root`              | Browser profile directory                 | `.output/web-bot/profiles`        |
-| Global           | `--cache-db`                  | SQLite cache database path                | `.output/web-bot/db/cache.sqlite` |
-| `crawl`          | `--format`                    | Input format: `text`, `ndjson`, or `json` | `text`                             |
-| `crawl`          | `--url-pointer`               | JSON Pointer to extract URL               | none                               |
-| `crawl`          | `--tag kind:key`              | Attach global tag to every seed           | none                               |
-| `crawl`          | `--tag-pointer kind=/pointer` | Attach JSON-derived tags                  | none                               |
-| `crawl`          | `--max-pages`                 | Max pages to crawl                        | `50`                               |
-| `crawl`          | `--max-depth`                 | Max crawl depth                           | `1`                                |
-| `crawl`          | `--no-cache`                  | Disable cache lookup/storage              | `false`                            |
-| `crawl`          | `--json`                      | Output results as NDJSON                  | `false`                            |
-| `cache lookup`   | `--json`                      | Output metadata as JSON                   | `false`                            |
-| `cache lookup`   | `--full`                      | Include payload bodies when possible      | `false`                            |
-| `cache snapshot` | `-o, --output`                | Save snapshot to file                     | stdout                             |
-| `cache remove`   | `--force`                     | Skip confirmation                         | `false`                            |
-| `cache clear`    | `--force`                     | Skip confirmation                         | `false`                            |
-| `cache stats`    | `--json`                      | Output stats as JSON                      | `false`                            |
+| Scope            | Flag                          | TOML setting              | Description                              | Default                            |
+| ---------------- | ----------------------------- | ------------------------- | ---------------------------------------- | ---------------------------------- |
+| Global           | `--profile-root`              | n/a                       | Browser profile directory                | `.output/web-bot/profiles`         |
+| Global           | `--cache-db`                  | n/a                       | SQLite cache database path               | `.output/web-bot/db/cache.sqlite`  |
+| `crawl`          | `--config`                    | n/a                       | Load crawl settings from TOML            | none                               |
+| `crawl`          | `-i`, `--input`               | `[input].urls`            | URL input or `-` for stdin               | stdin when empty                   |
+| `crawl`          | `--format`                    | `[input].format`          | Input format: `text`, `ndjson`, `json`   | `text`                             |
+| `crawl`          | `--url-pointer`               | `[input].url-pointer`     | JSON Pointer to extract URL              | none / top-level `url`             |
+| `crawl`          | `--tag kind:key`              | `[tags].global`           | Attach global tag to every seed          | none                               |
+| `crawl`          | `--tag-pointer kind=/pointer` | `[tags].pointers`         | Attach JSON-derived tags                 | none                               |
+| `crawl`          | `--output`                    | `[output].format`         | Output format: `human`, `ndjson`         | `human`                            |
+| `crawl`          | `--pages`                     | `[budget].pages`          | Max opened pages per seed                | `10`                               |
+| `crawl`          | `--total-pages`               | `[budget].total-pages`    | Global crawl page budget                 | none                               |
+| `crawl`          | `--depth`                     | `[budget].depth`          | Max crawl depth                          | `1`                                |
+| `crawl`          | `--frontier-items`            | `[budget].frontier-items` | Max retained frontier URLs               | `100000`                           |
+| `crawl`          | `--jobs`                      | `[runtime].jobs`          | Global in-flight page jobs               | `8`                                |
+| `crawl`          | `--sessions`                  | `[runtime].sessions`      | Max browser sessions                     | `4`                                |
+| `crawl`          | `--tabs`                      | `[runtime].tabs`          | Max tabs/pages per session               | `2`                                |
+| `crawl`          | `--cache-jobs`                | `[runtime].cache-jobs`    | Max concurrent cache operations          | `32`                               |
+| `crawl`          | `--rotate`                    | `[runtime].rotate`        | Pages before browser session rotation    | `150`                              |
+| `crawl`          | `--timeout-secs`              | `[runtime].timeout-secs`  | Page open timeout in seconds             | `45`                               |
+| `crawl`          | `--profile-strategy`          | `[profile].strategy`      | Browser profile assignment strategy      | `by-seed-host`                     |
+| `crawl`          | `--profile`                   | `[profile].key`           | Fallback/single browser profile key      | `default`                          |
+| `crawl`          | `--namespace`                 | `[cache].namespace`       | Optional cache namespace                 | none                               |
+| `crawl`          | `--no-cache`                  | `[cache].enabled`         | Disable SQLite cache lookup/storage      | `false`                            |
+| `cache lookup`   | `--json`                      | n/a                       | Output metadata as JSON                  | `false`                            |
+| `cache lookup`   | `--full`                      | n/a                       | Include payload bodies when possible     | `false`                            |
+| `cache snapshot` | `-o`, `--output`              | n/a                       | Save snapshot to file                    | stdout                             |
+| `cache remove`   | `--force`                     | n/a                       | Skip confirmation                        | `false`                            |
+| `cache clear`    | `--force`                     | n/a                       | Skip confirmation                        | `false`                            |
+| `cache stats`    | `--json`                      | n/a                       | Output stats as JSON                     | `false`                            |
+
+## Compatibility Notes
+
+Older crawl flags are retained as aliases where supported:
+
+| Older flag                              | Preferred flag      |
+| --------------------------------------- | ------------------- |
+| `--max-pages`                           | `--pages`           |
+| `--max-pages-per-seed`                  | `--pages`           |
+| `--max-total-pages`                     | `--total-pages`     |
+| `--max-depth`                           | `--depth`           |
+| `--max-frontier-items`                  | `--frontier-items`  |
+| `--max-concurrent-pages`                | `--jobs`            |
+| `--max-sessions`                        | `--sessions`        |
+| `--max-concurrent-pages-per-session`    | `--tabs`            |
+| `--max-concurrent-cache-ops`            | `--cache-jobs`      |
+| `--max-pages-per-session`               | `--rotate`          |
+| `--timeout`                             | `--timeout-secs`    |
+| `--json`                                | `--output ndjson`   |
+
+Older TOML keys are accepted as compatibility aliases where supported:
+
+| Older TOML key                         | Preferred TOML key        |
+| -------------------------------------- | ------------------------- |
+| `[input].inputs`                       | `[input].urls`            |
+| `[budget].pages-per-seed`              | `[budget].pages`          |
+| `[budget].max-pages`                   | `[budget].pages`          |
+| `[budget].max-total-pages`             | `[budget].total-pages`    |
+| `[budget].max-depth`                   | `[budget].depth`          |
+| `[budget].max-frontier-items`          | `[budget].frontier-items` |
+| `[runtime].page-jobs`                  | `[runtime].jobs`          |
+| `[runtime].browser-sessions`           | `[runtime].sessions`      |
+| `[runtime].tabs-per-session`           | `[runtime].tabs`          |
+| `[runtime].pages-before-session-rotation` | `[runtime].rotate`     |
+| `[runtime].page-open-timeout-secs`     | `[runtime].timeout-secs`  |
+| `[output].json = true`                 | `[output].format = "ndjson"` |
+
+`--attach-provenance` is deprecated and ignored. Use tags instead:
+
+```bash
+web-bot crawl \
+  --format ndjson \
+  --url-pointer /website \
+  --tag-pointer entity=/id \
+  --tag-pointer batch=/batch_id
+```
 
 ## Philosophy
 

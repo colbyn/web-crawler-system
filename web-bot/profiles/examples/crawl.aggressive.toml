@@ -1,0 +1,42 @@
+# Aggressive crawl profile.
+#
+# Higher concurrency for machines with enough CPU and memory.
+# Not ideal for debugging correctness.
+#
+# cat urls.txt | web-bot crawl --config web-bot/config/crawl.aggressive.toml
+#
+
+[input]
+urls = ["-"]
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:aggressive"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 25
+total-pages = 20000
+depth = 1
+frontier-items = 250000
+
+[runtime]
+jobs = 24
+sessions = 6
+tabs = 4
+cache-jobs = 96
+rotate = 250
+timeout-secs = 45
+
+[profile]
+strategy = "by-seed-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

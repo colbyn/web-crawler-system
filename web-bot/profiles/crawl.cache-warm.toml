@@ -1,0 +1,41 @@
+# Cache warming profile.
+#
+# Shallow, broad crawl intended to populate reusable page evidence quickly.
+#
+# cat urls.txt | web-bot crawl --config web-bot/config/crawl.cache-warm.toml
+#
+
+[input]
+urls = ["-"]
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:cache-warm"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 3
+total-pages = 10000
+depth = 0
+frontier-items = 50000
+
+[runtime]
+jobs = 12
+sessions = 4
+tabs = 3
+cache-jobs = 64
+rotate = 250
+timeout-secs = 35
+
+[profile]
+strategy = "by-host"
+key = "default"
+
+[cache]
+enabled = true
+namespace = "default"

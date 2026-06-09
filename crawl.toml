@@ -1,0 +1,54 @@
+# crawl.toml
+#
+# Precedence:
+#   explicit CLI arg > this TOML file > hardcoded CLI default
+
+# # Input parsing
+# format = "ndjson"
+# url-pointer = "/website"
+
+# # Seed inputs can live here, or you can still pass `-i ...` on the CLI.
+# # CLI inputs are appended to these.
+# inputs = [
+#   "https://books.toscrape.com",
+#   "https://quotes.toscrape.com/js/"
+# ]
+
+# # Durable cache associations.
+# # CLI --tag values are appended to these.
+# tags = [
+#   "run:manual-debug",
+#   "source:local-config"
+# ]
+
+# # Extract tags from structured JSON input rows.
+# # Example input row:
+# #   {"id":"biz_123","website":"https://example.com","category":"electrician"}
+# tag-pointers = [
+#   "entity=/id",
+#   "category=/category"
+# ]
+
+# Output
+# json = false
+
+# Crawl budget
+max-pages-per-seed = 10
+max-total-pages = 100
+max-depth = 1
+max-frontier-items = 100_000
+
+# Concurrency
+max-concurrent-pages = 8
+max-sessions = 4
+max-concurrent-pages-per-session = 2
+max-concurrent-cache-ops = 32
+max-pages-per-session = 150
+
+# Browser profile behavior
+profile-strategy = "by-seed-host"
+profile-key = "default"
+
+# # Cache behavior
+# no-cache = false
+

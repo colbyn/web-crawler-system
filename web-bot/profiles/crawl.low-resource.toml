@@ -1,0 +1,41 @@
+# Low-resource crawl profile.
+#
+# Useful on laptops, remote shells with limited memory, or while multitasking.
+#
+# web-bot crawl --config web-bot/config/crawl.low-resource.toml -i https://example.com
+#
+
+[input]
+urls = []
+format = "text"
+url-pointer = "/url"
+attach-provenance = false
+
+[tags]
+global = ["run:low-resource"]
+pointers = []
+
+[output]
+format = "human"
+
+[budget]
+pages = 10
+total-pages = 100
+depth = 1
+frontier-items = 25000
+
+[runtime]
+jobs = 2
+sessions = 1
+tabs = 2
+cache-jobs = 8
+rotate = 50
+timeout-secs = 60
+
+[profile]
+strategy = "single"
+key = "low-resource"
+
+[cache]
+enabled = true
+namespace = "default"
