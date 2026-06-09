@@ -55,6 +55,7 @@ pub struct SeedGroup<P = serde_json::Value> {
     pub label: Option<String>,
 
     /// Caller-owned metadata shared by all seeds in this group.
+    #[deprecated(note = "Use CrawlAssociation instead.")]
     pub provenance: P,
 
     pub seeds: Vec<CrawlSeed>,
@@ -100,6 +101,7 @@ pub struct CrawlRequest<P = serde_json::Value> {
     pub profile_key: Option<BrowserProfileKey>,
 
     /// Caller-owned provenance.
+    #[deprecated(note = "Use CrawlAssociation instead.")]
     pub provenance: P,
 }
 
