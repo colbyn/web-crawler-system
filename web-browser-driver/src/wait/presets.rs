@@ -19,7 +19,7 @@ use std::time::{
 };
 
 use crate::{
-    wait::{
+    BrowserDriverError, BrowserDriverResult, BrowserPage, DocumentReadyState, OpenPageOptions, PageTelemetryBuilder, PageTelemetryEventKind, wait::{
         All,
         BodyExists,
         DomComplete,
@@ -27,13 +27,7 @@ use crate::{
         ResourceTimingIdle,
         WaitCondition,
         WaitOptions,
-    },
-    BrowserDriverError,
-    BrowserDriverResult,
-    BrowserPage,
-    DocumentReadyState,
-    PageTelemetryBuilder,
-    PageTelemetryEventKind,
+    }
 };
 
 /// Practical page-readiness presets.
@@ -79,6 +73,7 @@ impl LoadStrategy {
         &self,
         page: &BrowserPage,
         telemetry: &mut PageTelemetryBuilder,
+        max_timeout: Duration,
     ) -> BrowserDriverResult<()> {
         match self {
             LoadStrategy::None => {
@@ -95,7 +90,7 @@ impl LoadStrategy {
                         Box::new(BodyExists),
                     ]),
                     WaitOptions {
-                        timeout: Duration::from_secs(15),
+                        timeout: Duration::from_secs(15).min(max_timeout),
                         interval: Duration::from_millis(150),
                     },
                     None,
@@ -113,10 +108,10 @@ impl LoadStrategy {
                         Box::new(ResourceTimingIdle::new(Duration::from_millis(500))),
                     ]),
                     WaitOptions {
-                        timeout: Duration::from_secs(35),
+                        timeout: Duration::from_secs(35).min(max_timeout),
                         interval: Duration::from_millis(250),
                     },
-                    Some(Duration::from_millis(750)),
+                    Some(Duration::from_millis(500)),
                 )
                 .await
             }
@@ -131,7 +126,7 @@ impl LoadStrategy {
                         Box::new(ResourceTimingIdle::new(Duration::from_millis(1250))),
                     ]),
                     WaitOptions {
-                        timeout: Duration::from_secs(55),
+                        timeout: Duration::from_secs(55).min(max_timeout),
                         interval: Duration::from_millis(250),
                     },
                     Some(Duration::from_millis(1500)),
@@ -148,7 +143,7 @@ impl LoadStrategy {
                         Box::new(BodyExists),
                     ]),
                     WaitOptions {
-                        timeout: Duration::from_secs(35),
+                        timeout: Duration::from_secs(35).min(max_timeout),
                         interval: Duration::from_millis(250),
                     },
                     None,

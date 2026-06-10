@@ -30,6 +30,8 @@ pub struct OpenPageOptions {
 
     /// Optional hard timeout for this open operation.
     pub timeout: Option<Duration>,
+
+    pub navigation_timeout: Option<Duration>,
 }
 
 impl OpenPageOptions {
@@ -38,11 +40,17 @@ impl OpenPageOptions {
             requested_url,
             load_strategy: LoadStrategy::Balanced,
             timeout: Some(Duration::from_secs(35)),
+            navigation_timeout: None,
         }
     }
 
     pub fn simple(requested_url: Url) -> Self {
         Self::new(requested_url)
+    }
+
+    pub fn with_navigation_timeout(mut self, delta: Duration) -> Self {
+        self.navigation_timeout = Some(delta);
+        self
     }
 }
 

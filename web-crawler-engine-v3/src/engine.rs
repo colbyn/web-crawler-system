@@ -513,6 +513,7 @@ where
 
         let requested_url = request.requested_url.clone();
 
+        // let page_timeout = self.config.page_open_timeout;
         let result = self.crawl_live_page(
             &request,
             cache_key.clone(),
@@ -640,12 +641,13 @@ where
             format!("🌐 {}", request.requested_url.as_str().magenta()).cyan()
         );
 
-        let mut open_options = OpenPageOptions::new(request.requested_url.clone());
+        let mut open_options = OpenPageOptions::new(request.requested_url.clone())
+            .with_navigation_timeout(self.config.page_open_timeout);
 
         // The engine already wraps the whole live page crawl in page_open_timeout.
         // Do not apply the exact same timeout again inside the browser open call,
         // or slow-but-scrapeable pages get killed twice by the same clock.
-        open_options.timeout = None;
+        // open_options.timeout = None;
 
         let opened = match session.open_page(open_options).await {
             Ok(opened) => opened,

@@ -1,3 +1,8 @@
+# Announcement
+
+AI: way dumber than expected.
+
+
 # Web Crawler System
 
 Rust workspace for crawling websites into a shared SQLite-backed page cache.
