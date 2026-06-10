@@ -133,11 +133,11 @@ impl SqliteCache {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(30));
+            .busy_timeout(std::time::Duration::from_secs(10));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(60))
+            .max_connections(8)
+            .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(options)
             .await?;
 
