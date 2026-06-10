@@ -511,44 +511,57 @@ where
 
         let session = lease.session();
 
-        let page_timeout = self.config.page_open_timeout;
         let requested_url = request.requested_url.clone();
 
-        let result = match tokio::time::timeout(
-            page_timeout,
-            self.crawl_live_page(
-                &request,
-                cache_key.clone(),
-                assignment,
-                session,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result?,
-
-            Err(_) => {
-                tracing::warn!(
-                    requested_url = %requested_url,
-                    timeout_ms = page_timeout.as_millis(),
-                    "page crawl timed out"
-                );
-
-                CrawlPageResult {
-                    request: request.clone(),
-                    cache_key: Some(cache_key),
-                    cache_decision: None,
-                    outcome: CrawlPageOutcome::Failed {
-                        error: format!(
-                            "page crawl timed out after {}ms",
-                            page_timeout.as_millis()
-                        ),
-                        retryable: true,
-                        should_terminate_session: false,
-                    },
-                }
+        let result = self.crawl_live_page(
+            &request,
+            cache_key.clone(),
+            assignment,
+            session,
+        ).await;
+        let result = match result {
+            Ok(x) => x,
+            Err(error) => {
+                return Err(error)
             }
         };
+        
+        // let page_timeout = self.config.page_open_timeout;
+        // let result = match tokio::time::timeout(
+        //     page_timeout,
+        //     self.crawl_live_page(
+        //         &request,
+        //         cache_key.clone(),
+        //         assignment,
+        //         session,
+        //     ),
+        // )
+        // .await
+        // {
+        //     Ok(result) => result?,
+
+        //     Err(_) => {
+        //         tracing::warn!(
+        //             requested_url = %requested_url,
+        //             timeout_ms = page_timeout.as_millis(),
+        //             "page crawl timed out"
+        //         );
+
+        //         CrawlPageResult {
+        //             request: request.clone(),
+        //             cache_key: Some(cache_key),
+        //             cache_decision: None,
+        //             outcome: CrawlPageOutcome::Failed {
+        //                 error: format!(
+        //                     "page crawl timed out after {}ms",
+        //                     page_timeout.as_millis()
+        //                 ),
+        //                 retryable: true,
+        //                 should_terminate_session: false,
+        //             },
+        //         }
+        //     }
+        // };
 
         tracing::debug!(
             requested_url = %requested_url,
