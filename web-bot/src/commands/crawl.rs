@@ -470,7 +470,8 @@ pub async fn run(
         return Ok(());
     }
 
-    let _ = utils::randomize_parsed_seed_order(&mut parsed);
+    let input_order_seed = utils::randomize_parsed_seed_order(&mut parsed);
+    eprintln!("Input order: randomized seed={}", input_order_seed);
 
     if !settings.is_ndjson_output() {
         print_run_header(
