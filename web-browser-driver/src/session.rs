@@ -127,8 +127,10 @@ impl BrowserSession {
         let page = BrowserPage::from_chromiumoxide(chromium_page);
 
         let wait_options = WaitOptions {
-            timeout: Duration::from_secs(3),
-            interval: Duration::from_millis(500),
+            timeout: {
+                Duration::from_secs(4)
+            },
+            interval: Duration::from_millis(150),
         };
 
         options
