@@ -544,7 +544,7 @@ where
                             page_timeout.as_millis()
                         ),
                         retryable: true,
-                        should_terminate_session: true,
+                        should_terminate_session: false,
                     },
                 }
             }
