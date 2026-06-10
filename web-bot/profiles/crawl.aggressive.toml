@@ -43,6 +43,7 @@ timeout-secs = 12
 # strategy = "by-seed-host"
 # key = "default"
 
+[profile]
 strategy = "single"
 key = "bulk-depth0"
 
