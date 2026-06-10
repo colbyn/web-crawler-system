@@ -48,6 +48,10 @@ impl OpenPageOptions {
         Self::new(requested_url)
     }
 
+    pub fn with_max_timeout(mut self, delta: Duration) -> Self {
+        self.timeout = Some(delta);
+        self
+    }
     pub fn with_navigation_timeout(mut self, delta: Duration) -> Self {
         self.navigation_timeout = Some(delta);
         self

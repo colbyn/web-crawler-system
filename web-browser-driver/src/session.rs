@@ -20,6 +20,8 @@
 //! reports a disconnect, protocol failure, or exits unexpectedly, the session is
 //! treated as unsafe and future page operations fail fast.
 
+use std::time::Duration;
+
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -31,7 +33,7 @@ use crate::{
     OpenPageOptions,
     OpenedPage,
     PageTelemetryBuilder,
-    UrlResolution,
+    UrlResolution, WaitOptions,
 };
 
 pub struct BrowserSession {
@@ -124,9 +126,14 @@ impl BrowserSession {
 
         let page = BrowserPage::from_chromiumoxide(chromium_page);
 
+        let wait_options = WaitOptions {
+            timeout: Duration::from_secs(3),
+            interval: Duration::from_millis(100),
+        };
+
         options
             .load_strategy
-            .wait(&page, &mut telemetry, options.navigation_timeout, options.timeout)
+            .wait(&page, &mut telemetry, wait_options)
             .await
             .map_err(|e| self.health.prefer_health_error(e))?;
 

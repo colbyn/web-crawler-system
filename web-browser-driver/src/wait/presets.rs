@@ -55,8 +55,7 @@ impl LoadStrategy {
         &self,
         page: &BrowserPage,
         telemetry: &mut PageTelemetryBuilder,
-        navigation_timeout: Option<Duration>,
-        max_timeout: Option<Duration>,
+        wait_options: WaitOptions,
     ) -> BrowserDriverResult<()> {
         match self {
             LoadStrategy::None => {
@@ -73,12 +72,7 @@ impl LoadStrategy {
                         Box::new(BodyExists),
                         Box::new(ResourceTimingIdle::new(Duration::from_millis(500))),
                     ]),
-                    WaitOptions {
-                        timeout: {
-                            navigation_timeout.or(max_timeout).unwrap_or(Duration::from_secs(10))
-                        },
-                        interval: Duration::from_millis(250),
-                    },
+                    wait_options,
                     Some(Duration::from_millis(500)),
                 )
                 .await

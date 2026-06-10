@@ -644,6 +644,7 @@ where
         let open_options = OpenPageOptions::new(
             request.requested_url.clone()
         )
+        .with_max_timeout(self.config.page_open_timeout)
         .with_navigation_timeout(self.config.page_open_timeout);
 
         // The engine already wraps the whole live page crawl in page_open_timeout.
