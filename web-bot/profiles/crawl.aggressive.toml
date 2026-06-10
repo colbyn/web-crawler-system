@@ -25,17 +25,26 @@ total-pages = 20000
 depth = 1
 frontier-items = 250000
 
-[runtime]
-jobs = 24
-sessions = 6
-tabs = 4
-cache-jobs = 96
-rotate = 250
-timeout-secs = 45
+# [runtime]
+# jobs = 24
+# sessions = 6
+# tabs = 4
+# cache-jobs = 96
+# rotate = 250
+# timeout-secs = 45
 
-[profile]
-strategy = "by-seed-host"
-key = "default"
+[runtime]
+jobs = 16
+sessions = 1
+tabs = 16
+timeout-secs = 12
+
+# [profile]
+# strategy = "by-seed-host"
+# key = "default"
+
+strategy = "single"
+key = "bulk-depth0"
 
 # [cache]
 # enabled = true
