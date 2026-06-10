@@ -522,6 +522,16 @@ where
         let result = match result {
             Ok(x) => x,
             Err(error) => {
+                tracing::warn!(
+                    requested_url = %requested_url,
+                    error = %error,
+                    "critical failure"
+                );
+                eprintln!("{}", format!(
+                    "❌🚨🚩☠️ {} critical failure: {}",
+                    requested_url.magenta(),
+                    error
+                ).red());
                 return Err(error)
             }
         };
