@@ -609,8 +609,11 @@ where
         assignment: BrowserProfileAssignment,
         session: Arc<BrowserSession>,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
+        use chrono::Local;
+
         eprintln!(
-            "{}",
+            "{} {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
             format!("🌐 {}", request.requested_url.as_str().magenta()).cyan()
         );
 

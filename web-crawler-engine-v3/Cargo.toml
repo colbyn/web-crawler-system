@@ -19,6 +19,7 @@ colored = "3.0.0"
 colored_json = "5.0.0"
 indexmap = { version = "2.10.0", features = ['serde']}
 futures = "0.3"
+chrono = "0.4.45"
 
 sqlx = { workspace = true}
 
