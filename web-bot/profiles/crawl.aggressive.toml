@@ -38,7 +38,7 @@ jobs = 16
 sessions = 1
 tabs = 16
 timeout-secs = 8
-rotate = 1000
+rotate = 300
 
 # [profile]
 # strategy = "by-seed-host"
