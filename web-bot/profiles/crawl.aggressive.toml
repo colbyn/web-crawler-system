@@ -37,7 +37,7 @@ frontier-items = 250000
 jobs = 16
 sessions = 1
 tabs = 16
-timeout-secs = 8
+timeout-secs = 12
 rotate = 300
 
 # [profile]
