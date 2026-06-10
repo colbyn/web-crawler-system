@@ -31,6 +31,8 @@ mod args;
 mod common;
 mod settings;
 
+pub mod utils;
+
 pub use args::CrawlArgs;
 pub use common::{
     CrawlInputFormat,
@@ -467,6 +469,8 @@ pub async fn run(
 
         return Ok(());
     }
+
+    let _ = utils::randomize_parsed_seed_order(&mut parsed);
 
     if !settings.is_ndjson_output() {
         print_run_header(
