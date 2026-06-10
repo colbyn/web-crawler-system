@@ -10,6 +10,26 @@
 //!
 //! Keep shared user-facing concepts here so the CLI and config format do not
 //! drift into separate dialects.
+//!
+//! ## Input formats
+//!
+//! The crawl command supports three practical input lanes:
+//!
+//! - `text` is the Unix-friendly default: plain URL lists from files, flags, or
+//!   stdin.
+//! - `ndjson` is the adapter lane for foreign newline-delimited JSON. It uses a
+//!   URL JSON pointer plus optional tag JSON pointers.
+//! - `seed-bundle` is the WebBot-native structured JSON lane. Each input line is
+//!   one seed bundle shaped like:
+//!
+//!   ```json
+//!   {"urls":["https://example.com"],"tags":[{"kind":"run.id","key":"batch-1"}]}
+//!   ```
+//!
+//! In the engine/cache API, tags are `kind + key` pairs. The SQLite cache may
+//! also store a compound printable `tag` string internally, but that is not part
+//! of the public input model. Structured JSON input therefore accepts exactly
+//! `{ kind, key }` tag objects and no separate value field.
 
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -24,13 +44,33 @@ pub enum CrawlInputFormat {
     Text,
 
     /// Newline-delimited JSON, one JSON object per input line.
+    ///
+    /// This is the adapter format for foreign JSON feeds. Use `url-pointer` to
+    /// select the crawl URL and `tag-pointer` entries to derive tags from JSON
+    /// scalar fields.
     Ndjson,
+
+    /// WebBot-native newline-delimited seed bundles.
+    ///
+    /// Each input line must be a JSON object with this shape:
+    ///
+    /// ```json
+    /// {
+    ///   "urls": ["https://example.com"],
+    ///   "tags": [
+    ///     { "kind": "run.id", "key": "batch-1" }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Each URL expands into an independent crawl seed carrying the full tag
+    /// set from the bundle plus any global tags configured through CLI/TOML.
+    SeedBundle,
 
     /// JSON input.
     ///
-    /// The current command parser treats this like line-oriented JSON for
-    /// compatibility with earlier behavior. Full JSON-array ingestion can be
-    /// added later without changing the public enum.
+    /// Reserved for full-document JSON ingestion. The current command should not
+    /// silently treat this as either pointer-mapped NDJSON or seed-bundle NDJSON.
     Json,
 }
 
@@ -80,14 +120,47 @@ impl Default for CrawlProfileStrategy {
     }
 }
 
-/// A tag extracted from a JSON input row.
+/// A tag extraction rule for generic pointer-mapped JSON input.
+///
+/// This is used by the `ndjson` adapter format, where the input JSON shape is
+/// owned by some foreign producer and WebBot is told how to extract tags.
 #[derive(Debug, Clone)]
 pub struct TagPointer {
     pub kind: String,
     pub pointer: String,
 }
 
+/// One WebBot-native crawl seed bundle input object.
+///
+/// This is used by the `seed-bundle` input format. Each URL becomes one crawl
+/// seed, and every expanded seed receives the full tag set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedBundle {
+    pub urls: Vec<String>,
+
+    #[serde(default)]
+    pub tags: Vec<InputTag>,
+}
+
+/// A structured tag from WebBot-native JSON seed-bundle input.
+///
+/// This mirrors the public cache tag model: tags are `kind + key` pairs. There
+/// is intentionally no `value` field here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputTag {
+    pub kind: String,
+    pub key: String,
+}
+
 /// Parse a single `kind:key` cache tag.
+///
+/// This is used by CLI/TOML global tags, for example:
+///
+/// - `run:manual-debug`
+/// - `category:electricians`
+/// - `entity.ids.place_id:ChIJ...`
 pub fn parse_tag(value: &str) -> anyhow::Result<CacheTag> {
     let trimmed = value.trim();
 
@@ -110,6 +183,66 @@ pub fn parse_tags(values: &[String]) -> anyhow::Result<Vec<CacheTag>> {
     values.iter().map(|value| parse_tag(value)).collect()
 }
 
+/// Validate a structured tag kind used by seed-bundle JSON input.
+///
+/// WebBot accepts a general dotted namespace instead of a fixed producer enum.
+/// Producer-specific tools may use stricter schemas, but the crawler should only
+/// require a stable, machine-readable namespace shape.
+pub fn validate_tag_kind(kind: &str) -> anyhow::Result<()> {
+    let kind = kind.trim();
+
+    if kind.is_empty() {
+        anyhow::bail!("tag kind cannot be empty");
+    }
+
+    for part in kind.split('.') {
+        if part.is_empty() {
+            anyhow::bail!("tag kind `{}` contains an empty namespace segment", kind);
+        }
+
+        let mut chars = part.chars();
+
+        let Some(first) = chars.next() else {
+            anyhow::bail!("tag kind `{}` contains an empty namespace segment", kind);
+        };
+
+        if !first.is_ascii_lowercase() {
+            anyhow::bail!(
+                "tag kind `{}` must use lowercase dotted namespace segments",
+                kind
+            );
+        }
+
+        if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+            anyhow::bail!(
+                "tag kind `{}` must contain only lowercase letters, digits, underscores, and dots",
+                kind
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert one structured seed-bundle JSON tag into a cache tag.
+pub fn parse_input_tag(tag: InputTag) -> anyhow::Result<CacheTag> {
+    let kind = tag.kind.trim();
+    let key = tag.key.trim();
+
+    validate_tag_kind(kind)?;
+
+    if key.is_empty() {
+        anyhow::bail!("tag key cannot be empty for kind `{}`", kind);
+    }
+
+    Ok(CacheTag::new(kind, key.to_string()))
+}
+
+/// Convert many structured seed-bundle JSON tags into cache tags.
+pub fn parse_input_tags(tags: Vec<InputTag>) -> anyhow::Result<Vec<CacheTag>> {
+    tags.into_iter().map(parse_input_tag).collect()
+}
+
 /// Parse a `kind=/json/pointer` tag-pointer specification.
 pub fn parse_tag_pointer(value: &str) -> anyhow::Result<TagPointer> {
     let Some((kind, pointer)) = value.split_once('=') else {
@@ -122,9 +255,7 @@ pub fn parse_tag_pointer(value: &str) -> anyhow::Result<TagPointer> {
     let kind = kind.trim();
     let pointer = pointer.trim();
 
-    if kind.is_empty() {
-        anyhow::bail!("tag pointer kind cannot be empty");
-    }
+    validate_tag_kind(kind)?;
 
     if !pointer.starts_with('/') {
         anyhow::bail!(
@@ -201,4 +332,3 @@ pub fn tags_from_json_pointers(
 
     Ok(tags)
 }
-

@@ -13,6 +13,19 @@
 //! Keep anything involving both CLI args and crawl settings in this file. That
 //! keeps the two data models independent while still enforcing one coherent
 //! user-facing vocabulary.
+//!
+//! ## Input parsing lanes
+//!
+//! The command intentionally supports distinct input modes instead of guessing:
+//!
+//! - `text`: plain URL lists, split by line/whitespace.
+//! - `ndjson`: foreign newline-delimited JSON rows, adapted with JSON pointers.
+//! - `seed-bundle`: WebBot-native newline-delimited JSON seed bundles shaped as
+//!   `{ "urls": [...], "tags": [{ "kind": "...", "key": "..." }] }`.
+//! - `json`: reserved for future full-document JSON ingestion.
+//!
+//! `seed-bundle` expands each URL in a bundle into its own crawl seed while
+//! attaching the full bundle tag set plus any global CLI/TOML tags.
 
 mod args;
 mod common;
@@ -56,9 +69,11 @@ use web_crawler_engine_v3::{
 };
 
 use common::{
+    parse_input_tags,
     parse_tag_pointers,
     parse_tags,
     tags_from_json_pointers,
+    SeedBundle,
 };
 
 fn load_settings_from_args(args: &CrawlArgs) -> anyhow::Result<CrawlSettings> {
@@ -274,6 +289,39 @@ fn parse_json_input_line(
     Ok(())
 }
 
+fn parse_seed_bundle_input_line(
+    line: &str,
+    global_tags: &[CacheTag],
+    parsed: &mut Vec<(Url, Vec<CacheTag>)>,
+) -> anyhow::Result<()> {
+    let bundle: SeedBundle = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("Skipping invalid seed-bundle JSON line: {}", err);
+            return Ok(());
+        }
+    };
+
+    if bundle.urls.is_empty() {
+        eprintln!("Skipping seed bundle with no URLs");
+        return Ok(());
+    }
+
+    let mut tags = global_tags.to_vec();
+    tags.extend(parse_input_tags(bundle.tags)?);
+
+    for url_str in bundle.urls {
+        let trimmed = url_str.trim();
+
+        match Url::parse(trimmed) {
+            Ok(url) => parsed.push((url, tags.clone())),
+            Err(_) => eprintln!("Skipping invalid URL in seed bundle: {}", trimmed),
+        }
+    }
+
+    Ok(())
+}
+
 fn print_run_header(
     settings: &CrawlSettings,
     config_path: Option<&PathBuf>,
@@ -372,6 +420,14 @@ pub async fn run(
         );
     }
 
+    if settings.input.format == CrawlInputFormat::Json {
+        anyhow::bail!(
+            "`--format json` is reserved for future full-document JSON input; \
+             use `--format ndjson` for pointer-mapped JSON lines or \
+             `--format seed-bundle` for WebBot seed-bundle NDJSON"
+        );
+    }
+
     let mut parsed: Vec<(Url, Vec<CacheTag>)> = Vec::new();
 
     for line in raw_lines {
@@ -380,7 +436,7 @@ pub async fn run(
                 parse_text_input_line(&line, &global_tags, &mut parsed);
             }
 
-            CrawlInputFormat::Ndjson | CrawlInputFormat::Json => {
+            CrawlInputFormat::Ndjson => {
                 parse_json_input_line(
                     &line,
                     &settings,
@@ -388,6 +444,18 @@ pub async fn run(
                     &tag_pointers,
                     &mut parsed,
                 )?;
+            }
+
+            CrawlInputFormat::SeedBundle => {
+                parse_seed_bundle_input_line(
+                    &line,
+                    &global_tags,
+                    &mut parsed,
+                )?;
+            }
+
+            CrawlInputFormat::Json => {
+                unreachable!("json input format is rejected before parsing");
             }
         }
     }
