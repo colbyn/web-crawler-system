@@ -128,7 +128,7 @@ impl BrowserSession {
 
         let wait_options = WaitOptions {
             timeout: Duration::from_secs(3),
-            interval: Duration::from_millis(100),
+            interval: Duration::from_millis(500),
         };
 
         options
