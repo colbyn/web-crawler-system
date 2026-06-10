@@ -1,8 +1,3 @@
-# Announcement
-
-AI: way dumber than expected.
-
-
 # Web Crawler System
 
 Rust workspace for crawling websites into a shared SQLite-backed page cache.
@@ -158,3 +153,13 @@ See the full CLI documentation:
 ## License
 
 Copyright 2026 Colbyn Wadman
+
+# Announcements
+
+## 2026-06-09
+
+AI: can be pretty dumb. 
+
+Debugging auto generated code is like its own skill set. 
+
+The work continues.

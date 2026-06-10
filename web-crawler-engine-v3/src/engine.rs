@@ -641,8 +641,10 @@ where
             format!("🌐 {}", request.requested_url.as_str().magenta()).cyan()
         );
 
-        let mut open_options = OpenPageOptions::new(request.requested_url.clone())
-            .with_navigation_timeout(self.config.page_open_timeout);
+        let open_options = OpenPageOptions::new(
+            request.requested_url.clone()
+        )
+        .with_navigation_timeout(self.config.page_open_timeout);
 
         // The engine already wraps the whole live page crawl in page_open_timeout.
         // Do not apply the exact same timeout again inside the browser open call,

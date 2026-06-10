@@ -37,7 +37,8 @@ frontier-items = 250000
 jobs = 16
 sessions = 1
 tabs = 16
-timeout-secs = 12
+timeout-secs = 8
+rotate = 1000
 
 # [profile]
 # strategy = "by-seed-host"

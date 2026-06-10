@@ -19,15 +19,16 @@ use std::time::{
 };
 
 use crate::{
-    BrowserDriverError, BrowserDriverResult, BrowserPage, DocumentReadyState, OpenPageOptions, PageTelemetryBuilder, PageTelemetryEventKind, wait::{
-        All,
-        BodyExists,
-        DomComplete,
-        DomInteractive,
-        ResourceTimingIdle,
-        WaitCondition,
-        WaitOptions,
-    }
+    BrowserDriverError, BrowserDriverResult, BrowserPage, DocumentReadyState, PageTelemetryBuilder, PageTelemetryEventKind, 
+};
+
+use crate::wait::{
+    All,
+    BodyExists,
+    DomInteractive,
+    ResourceTimingIdle,
+    WaitCondition,
+    WaitOptions,
 };
 
 /// Practical page-readiness presets.
@@ -41,31 +42,12 @@ pub enum LoadStrategy {
     /// Useful for callers that want to perform their own custom wait logic.
     None,
 
-    /// Wait for an interactive DOM and a body element.
-    ///
-    /// This is the fastest useful scrape-oriented preset. It favors throughput
-    /// over hydration completeness.
-    FastDom,
-
     /// Wait for an interactive DOM, body presence, a short Performance API
     /// resource quiet window, then apply a small grace delay.
     ///
     /// This favors ordinary server-rendered and lightly hydrated pages without
     /// waiting for full document completion.
-    Balanced,
-
-    /// Wait longer for resource quiet and apply a longer grace delay.
-    ///
-    /// This is useful for slower SPA/hydrated pages, but still remains a
-    /// heuristic. It does not prove all client-side work has finished.
-    SpaTolerant,
-
-    /// Wait for `document.readyState === "complete"` and body presence.
-    ///
-    /// This can be useful when the caller specifically wants browser load
-    /// completion semantics, but it is not necessarily better for scraping than
-    /// `Balanced`.
-    DocumentComplete,
+    Default,
 }
 
 impl LoadStrategy {
@@ -73,7 +55,8 @@ impl LoadStrategy {
         &self,
         page: &BrowserPage,
         telemetry: &mut PageTelemetryBuilder,
-        max_timeout: Duration,
+        navigation_timeout: Option<Duration>,
+        max_timeout: Option<Duration>,
     ) -> BrowserDriverResult<()> {
         match self {
             LoadStrategy::None => {
@@ -81,24 +64,7 @@ impl LoadStrategy {
                 Ok(())
             }
 
-            LoadStrategy::FastDom => {
-                run_wait_strategy(
-                    page,
-                    telemetry,
-                    All(vec![
-                        Box::new(DomInteractive),
-                        Box::new(BodyExists),
-                    ]),
-                    WaitOptions {
-                        timeout: Duration::from_secs(15).min(max_timeout),
-                        interval: Duration::from_millis(150),
-                    },
-                    None,
-                )
-                .await
-            }
-
-            LoadStrategy::Balanced => {
+            LoadStrategy::Default => {
                 run_wait_strategy(
                     page,
                     telemetry,
@@ -108,45 +74,12 @@ impl LoadStrategy {
                         Box::new(ResourceTimingIdle::new(Duration::from_millis(500))),
                     ]),
                     WaitOptions {
-                        timeout: Duration::from_secs(35).min(max_timeout),
+                        timeout: {
+                            navigation_timeout.or(max_timeout).unwrap_or(Duration::from_secs(10))
+                        },
                         interval: Duration::from_millis(250),
                     },
                     Some(Duration::from_millis(500)),
-                )
-                .await
-            }
-
-            LoadStrategy::SpaTolerant => {
-                run_wait_strategy(
-                    page,
-                    telemetry,
-                    All(vec![
-                        Box::new(DomInteractive),
-                        Box::new(BodyExists),
-                        Box::new(ResourceTimingIdle::new(Duration::from_millis(1250))),
-                    ]),
-                    WaitOptions {
-                        timeout: Duration::from_secs(55).min(max_timeout),
-                        interval: Duration::from_millis(250),
-                    },
-                    Some(Duration::from_millis(1500)),
-                )
-                .await
-            }
-
-            LoadStrategy::DocumentComplete => {
-                run_wait_strategy(
-                    page,
-                    telemetry,
-                    All(vec![
-                        Box::new(DomComplete),
-                        Box::new(BodyExists),
-                    ]),
-                    WaitOptions {
-                        timeout: Duration::from_secs(35).min(max_timeout),
-                        interval: Duration::from_millis(250),
-                    },
-                    None,
                 )
                 .await
             }

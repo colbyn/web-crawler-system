@@ -38,8 +38,8 @@ impl OpenPageOptions {
     pub fn new(requested_url: Url) -> Self {
         Self {
             requested_url,
-            load_strategy: LoadStrategy::Balanced,
-            timeout: Some(Duration::from_secs(35)),
+            load_strategy: LoadStrategy::Default,
+            timeout: Some(Duration::from_secs(10)),
             navigation_timeout: None,
         }
     }
