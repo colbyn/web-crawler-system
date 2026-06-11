@@ -128,11 +128,11 @@ impl BrowserSession {
 
         let wait_options = WaitOptions {
             timeout: {
-                Duration::from_secs(3)
+                Duration::from_secs(5)
             },
-            interval: Duration::from_millis(150),
+            interval: Duration::from_millis(250),
         };
-        let grace_delay = Some(Duration::from_millis(1_000));
+        let grace_delay = Some(Duration::from_millis(1_500));
 
         options
             .load_strategy
