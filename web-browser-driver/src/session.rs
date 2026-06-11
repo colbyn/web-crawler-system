@@ -128,9 +128,9 @@ impl BrowserSession {
 
         let wait_options = WaitOptions {
             timeout: {
-                Duration::from_secs(5)
+                Duration::from_secs(4)
             },
-            interval: Duration::from_millis(250),
+            interval: Duration::from_millis(200),
         };
         let grace_delay = Some(Duration::from_millis(1_500));
 
