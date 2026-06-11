@@ -136,7 +136,7 @@ impl SqliteCache {
             .busy_timeout(std::time::Duration::from_secs(10));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(16)
+            .max_connections(32)
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(options)
             .await?;
