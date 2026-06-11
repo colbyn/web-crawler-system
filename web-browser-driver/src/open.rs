@@ -39,7 +39,7 @@ impl OpenPageOptions {
         Self {
             requested_url,
             load_strategy: LoadStrategy::Default,
-            timeout: Some(Duration::from_secs(10)),
+            timeout: Some(Duration::from_secs(6)),
             navigation_timeout: None,
         }
     }
