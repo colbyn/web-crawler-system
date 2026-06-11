@@ -347,6 +347,10 @@ where
             self.config.concurrency.max_concurrent_pages_per_session,
         )
         .with_rotation_callback(|profile_key, reason| {
+            eprintln!("{}", format!(
+                "{profile_key} browser session rotated: {}",
+                format!("{reason:?}").magenta()
+            ).cyan());
             tracing::info!(
                 target: "crawler::session",
                 profile_key = profile_key,
