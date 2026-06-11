@@ -56,6 +56,7 @@ impl LoadStrategy {
         page: &BrowserPage,
         telemetry: &mut PageTelemetryBuilder,
         wait_options: WaitOptions,
+        grace_delay: Option<Duration>,
     ) -> BrowserDriverResult<()> {
         match self {
             LoadStrategy::None => {
@@ -73,7 +74,7 @@ impl LoadStrategy {
                         Box::new(ResourceTimingIdle::new(Duration::from_millis(500))),
                     ]),
                     wait_options,
-                    Some(Duration::from_millis(500)),
+                    grace_delay,
                 )
                 .await
             }

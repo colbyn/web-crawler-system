@@ -128,14 +128,15 @@ impl BrowserSession {
 
         let wait_options = WaitOptions {
             timeout: {
-                Duration::from_secs(4)
+                Duration::from_secs(3)
             },
             interval: Duration::from_millis(150),
         };
+        let grace_delay = Some(Duration::from_millis(1_000));
 
         options
             .load_strategy
-            .wait(&page, &mut telemetry, wait_options)
+            .wait(&page, &mut telemetry, wait_options, grace_delay)
             .await
             .map_err(|e| self.health.prefer_health_error(e))?;
 
