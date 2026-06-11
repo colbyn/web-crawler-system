@@ -803,6 +803,10 @@ where
                         }
 
                         Err(err) => {
+                            eprintln!("{}", format!(
+                                "[cache] failed to save sqlite cache entry {}",
+                                err.to_string(),
+                            ).cyan());
                             tracing::warn!(
                                 requested_url = %request.requested_url,
                                 error = %err,
