@@ -24,3 +24,5 @@ chrono = "0.4.45"
 sqlx = { workspace = true}
 
 web-browser-driver = { path = "../web-browser-driver" }
+
+web-crawler-db = { path = "../web-crawler-db" }

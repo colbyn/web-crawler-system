@@ -25,7 +25,7 @@ pub enum CrawlEngineError {
     Browser(#[from] web_browser_driver::BrowserDriverError),
 
     #[error("cache error: {0}")]
-    Cache(#[from] crate::sqlite_cache::CacheError),
+    Cache(#[from] web_crawler_db::error::DbError),
 
     #[error("URL parse error: {0}")]
     Url(#[from] url::ParseError),

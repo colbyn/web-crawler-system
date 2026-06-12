@@ -21,12 +21,7 @@ use std::path::PathBuf;
 mod commands;
 
 #[derive(Parser)]
-#[command(
-    name = "web-bot",
-    version,
-    about = "Web crawler operations tool",
-    long_about = "A CLI for preemptively crawling content and inspecting the shared SQLite cache."
-)]
+#[command(name = "web-bot", version, about = "Web crawler operations tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -35,20 +30,23 @@ struct Cli {
     #[arg(long, default_value = ".output/web-bot/profiles")]
     profile_root: PathBuf,
 
-    /// SQLite cache database path
-    #[arg(long, default_value = ".output/web-bot/db/cache.sqlite")]
-    cache_db: PathBuf,
+    /// Postgres connection URL.
+    /// Falls back to DATABASE_URL environment variable if not provided.
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Crawl one or more URLs into the cache
     Crawl(commands::crawl::CrawlArgs),
-
-    /// Inspect and manage the page cache
     Cache {
         #[command(subcommand)]
         action: commands::cache::CacheCommands,
+    },
+    /// Database administration commands
+    Db {
+        #[command(subcommand)]
+        action: commands::db::DbCommands,
     },
 }
 
@@ -61,16 +59,36 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Resolve database URL (CLI flag > env var)
+    let database_url = cli.database_url.clone().or_else(|| {
+        std::env::var("DATABASE_URL").ok()
+    });
+
     match cli.command {
         Commands::Crawl(args) => {
-            commands::crawl::run(args, &cli.profile_root, &cli.cache_db).await?;
+            let db_url = database_url.as_deref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "No database URL provided. Use --database-url or set DATABASE_URL"
+                ))?;
+            commands::crawl::run(args, &cli.profile_root, db_url).await?;
         }
 
         Commands::Cache { action } => {
-            commands::cache::run(action, &cli.cache_db).await?;
+            let db_url = database_url.as_deref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "No database URL provided. Use --database-url or set DATABASE_URL"
+                ))?;
+            commands::cache::run(action, db_url).await?;
+        }
+
+        Commands::Db { action } => {
+            let db_url = database_url.as_deref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "No database URL provided. Use --database-url or set DATABASE_URL"
+                ))?;
+            commands::db::run(action, db_url).await?
         }
     }
 
     Ok(())
 }
-

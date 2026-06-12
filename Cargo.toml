@@ -10,5 +10,4 @@ branch = "main"
 
 [workspace.dependencies.sqlx]
 version = "0.8"
-features = ["runtime-tokio", "sqlite", "migrate"]
-
+features = ["runtime-tokio", "postgres", "json", "chrono", "migrate"]

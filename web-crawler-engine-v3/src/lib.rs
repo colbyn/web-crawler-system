@@ -79,7 +79,7 @@ pub mod output;
 pub mod policy;
 pub mod scheduler;
 pub mod sessions;
-pub mod sqlite_cache;
+// pub mod sqlite_cache;
 pub mod state;
 pub mod store;
 pub mod url;
@@ -144,7 +144,7 @@ pub use scheduler::{
 
 pub use sessions::SessionPool;
 
-pub use sqlite_cache::SqliteCache;
+// pub use sqlite_cache::SqliteCache;
 
 pub use state::CrawlRunState;
 

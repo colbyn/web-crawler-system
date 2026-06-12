@@ -1,32 +1,35 @@
 //! PostgreSQL implementation of the `web-crawler-db` artifact cache.
 //!
-//! `PostgresCache` is the main runtime SDK type for cached crawl artifacts.
+//! `PostgresCache` is the runtime SDK for durable crawler artifacts.
 //!
-//! This type intentionally does **not** create or migrate database schema when
-//! connecting. Schema setup belongs to explicit admin paths in `migrate.rs`.
-//! Crawlers and workers should be able to connect without accidentally changing
-//! database structure.
+//! This module intentionally does not create or migrate schema as a side effect
+//! of connecting. Schema setup belongs to explicit administrative paths in
+//! `migrate.rs`.
 //!
-//! The API separates hot-path replay from heavyweight artifact inspection:
+//! The cache model is deliberately small:
 //!
-//! - [`PostgresCache::get_metadata`] reads only metadata JSON.
-//! - [`PostgresCache::get_payload`] reads one payload body by ID.
-//! - [`PostgresCache::try_get_full_entry`] reads metadata, payloads, and tags.
-//! - [`PostgresCache::get`] is the forgiving hot-path wrapper that converts
-//!   per-entry corruption or decode failures into `None`.
+//! ```text
+//! CacheKey -> CacheEntry
 //!
-//! Writes validate [`CacheEntry`] before touching storage. This keeps caller-made
-//! impossible states out of Postgres.
+//! CacheEntry = metadata + one primary payload body + tags
+//! ```
 //!
-//! Tags remain secondary-index associations. They are merged idempotently through
-//! `(tag_kind, tag_key)` pairs and are not part of cache identity.
+//! Metadata and payload bytes are stored separately so hot replay paths can read
+//! page metadata without pulling large `BYTEA` values through Postgres.
+//!
+//! Tags are secondary-index associations. They are merged idempotently by
+//! default so crawler phases can attach new associations without erasing earlier
+//! ones.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{DbError, DbResult};
 use crate::key::{cache_key_digest, CacheKey};
-use crate::model::{CacheEntry, CacheEntryMetadata, CacheEntryRef, CachePayload, CacheTag};
+use crate::model::{
+    CacheEntry, CacheEntryMetadata, CacheEntryRef, CachePayload, CachePayloadCompression,
+    CachePayloadDescriptor, CacheTag,
+};
 use crate::queries;
 
 /// Main Postgres-backed cache for crawler artifacts.
@@ -56,7 +59,7 @@ impl PostgresCache {
 
     /// Construct a cache handle from an existing pool.
     ///
-    /// This is useful for applications that own their own Postgres pool and want
+    /// This is useful when an application already owns a Postgres pool and wants
     /// the cache SDK to share it.
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
@@ -68,9 +71,9 @@ impl PostgresCache {
     }
 }
 
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
 // Read API
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
 
 impl PostgresCache {
     /// Forgiving hot-path read.
@@ -107,18 +110,15 @@ impl PostgresCache {
 
     /// Strict full-entry read.
     ///
-    /// Loads metadata, all payload bodies, and tags. This is useful for
-    /// inspection, export, debugging, and consumers that truly need the complete
-    /// cache entry.
+    /// Loads metadata, the single primary payload body, and tags.
     pub async fn try_get_full_entry(&self, key: &CacheKey) -> DbResult<Option<CacheEntry>> {
         self.load_entry_raw(key).await
     }
 
     /// Read only metadata for a cache key.
     ///
-    /// This is the preferred hot replay path. It avoids pulling HTML bodies,
-    /// screenshots, or other large payload bytes through Postgres when the caller
-    /// only needs extracted replay data and payload descriptors.
+    /// This is the preferred hot replay path when the caller only needs
+    /// extracted page data and provenance.
     pub async fn get_metadata(&self, key: &CacheKey) -> DbResult<Option<CacheEntryMetadata>> {
         let key_digest = cache_key_digest(key)?;
 
@@ -141,50 +141,26 @@ impl PostgresCache {
         Ok(Some(metadata))
     }
 
-    /// Read one payload body by ID.
+    /// Read the single primary payload body for a cache key.
     ///
-    /// The descriptor is loaded from metadata, then the payload row is fetched
-    /// and verified against the descriptor checksum and byte length.
-    pub async fn get_payload(
-        &self,
-        key: &CacheKey,
-        payload_id: &str,
-    ) -> DbResult<Option<CachePayload>> {
+    /// Returns `Ok(None)` when the cache entry itself does not exist.
+    ///
+    /// Returns an invariant error when metadata exists but the payload row is
+    /// missing. That means the stored entry is incomplete.
+    pub async fn get_payload(&self, key: &CacheKey) -> DbResult<Option<CachePayload>> {
         let key_digest = cache_key_digest(key)?;
 
-        let Some(metadata) = self.get_metadata(key).await? else {
+        let Some(_metadata) = self.get_metadata(key).await? else {
             return Ok(None);
         };
 
-        let Some(descriptor) = metadata
-            .payloads
-            .iter()
-            .find(|descriptor| descriptor.payload_id == payload_id)
-            .cloned()
-        else {
-            return Ok(None);
+        let Some(payload) = self.load_payload_for_digest(&key_digest).await? else {
+            return Err(DbError::invariant(
+                "metadata row exists but payload row is missing",
+            ));
         };
 
-        let row = sqlx::query(queries::SELECT_PAYLOAD_FOR_KEY)
-            .bind(&key_digest)
-            .bind(payload_id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let body: Vec<u8> = row.try_get("body")?;
-
-        validate_payload_body(
-            payload_id,
-            &descriptor.sha256_hex,
-            descriptor.byte_len,
-            &body,
-        )?;
-
-        Ok(Some(CachePayload { descriptor, body }))
+        Ok(Some(payload))
     }
 
     async fn load_entry_raw(&self, key: &CacheKey) -> DbResult<Option<CacheEntry>> {
@@ -194,55 +170,17 @@ impl PostgresCache {
             return Ok(None);
         };
 
-        let payload_rows = sqlx::query(queries::SELECT_PAYLOADS_FOR_KEY)
-            .bind(&key_digest)
-            .fetch_all(&self.pool)
-            .await?;
+        let Some(payload) = self.load_payload_for_digest(&key_digest).await? else {
+            return Err(DbError::invariant(
+                "metadata row exists but payload row is missing",
+            ));
+        };
 
-        let mut payloads = Vec::with_capacity(payload_rows.len());
-
-        for row in payload_rows {
-            let payload_id: String = row.try_get("payload_id")?;
-            let body: Vec<u8> = row.try_get("body")?;
-
-            let Some(descriptor) = metadata
-                .payloads
-                .iter()
-                .find(|descriptor| descriptor.payload_id == payload_id)
-                .cloned()
-            else {
-                return Err(DbError::invariant(format!(
-                    "payload row has no matching metadata descriptor: {payload_id}"
-                )));
-            };
-
-            validate_payload_body(
-                &payload_id,
-                &descriptor.sha256_hex,
-                descriptor.byte_len,
-                &body,
-            )?;
-
-            payloads.push(CachePayload { descriptor, body });
-        }
-
-        let tag_rows = sqlx::query(queries::SELECT_TAGS_FOR_ENTRY)
-            .bind(&key_digest)
-            .fetch_all(&self.pool)
-            .await?;
-
-        let mut tags = Vec::with_capacity(tag_rows.len());
-
-        for row in tag_rows {
-            let kind: String = row.try_get("tag_kind")?;
-            let key: String = row.try_get("tag_key")?;
-
-            tags.push(CacheTag::raw(kind, key));
-        }
+        let tags = self.load_tags_for_digest(&key_digest).await?;
 
         let entry = CacheEntry {
             metadata,
-            payloads,
+            payload,
             tags,
         };
 
@@ -250,75 +188,56 @@ impl PostgresCache {
 
         Ok(Some(entry))
     }
+
+    async fn load_payload_for_digest(&self, key_digest: &str) -> DbResult<Option<CachePayload>> {
+        let row = sqlx::query(queries::SELECT_PAYLOAD_FOR_KEY)
+            .bind(key_digest)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(row_to_payload(row)?))
+    }
+
+    async fn load_tags_for_digest(&self, key_digest: &str) -> DbResult<Vec<CacheTag>> {
+        let rows = sqlx::query(queries::SELECT_TAGS_FOR_ENTRY)
+            .bind(key_digest)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows_to_tags(rows)
+    }
 }
 
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
 // Write API
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
 
 impl PostgresCache {
-    /// Store or update a cache entry.
+    /// Store or update a complete cache entry.
     ///
     /// Semantics:
     ///
-    /// - validates the entry before writing,
-    /// - upserts metadata,
-    /// - replaces all payload rows for the entry,
-    /// - merges tags idempotently.
+    /// - validates metadata and payload before writing,
+    /// - upserts the metadata row,
+    /// - upserts/replaces the single primary payload row,
+    /// - merges tags idempotently,
+    /// - does not remove existing tags.
     ///
-    /// Payload replacement plus tag merging is intentional but asymmetric. Use
-    /// `replace_tags` when the caller wants exact tag replacement.
+    /// Use [`PostgresCache::replace_tags`] when the caller wants exact tag
+    /// replacement.
     pub async fn put(&self, entry: &CacheEntry) -> DbResult<()> {
         entry.validate()?;
 
-        let key = entry.key();
-        let key_digest = cache_key_digest(key)?;
-
-        let key_json = serde_json::to_value(key)
-            .map_err(|error| DbError::json(error.to_string()))?;
-
-        let metadata_json = serde_json::to_value(&entry.metadata)
-            .map_err(|error| DbError::json(error.to_string()))?;
+        let key_digest = cache_key_digest(entry.key())?;
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(queries::UPSERT_CACHE_ENTRY)
-            .bind(&key_digest)
-            .bind(&key_json)
-            .bind(entry.metadata.metadata_version as i64)
-            .bind(&entry.metadata.entry_kind)
-            .bind(&entry.metadata.request.requested_url)
-            .bind(&entry.metadata.request.requested_host)
-            .bind(&entry.metadata.response.final_url)
-            .bind(&entry.metadata.response.final_host)
-            .bind(&entry.metadata.request.capture_policy_json)
-            .bind(entry.metadata.stored_at_unix_ms)
-            .bind(entry.metadata.response.status_code.map(|code| code as i64))
-            .bind(&entry.metadata.response.content_type)
-            .bind(&metadata_json)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(queries::DELETE_PAYLOADS_FOR_ENTRY)
-            .bind(&key_digest)
-            .execute(&mut *tx)
-            .await?;
-
-        for payload in &entry.payloads {
-            let descriptor = &payload.descriptor;
-
-            sqlx::query(queries::INSERT_PAYLOAD)
-                .bind(&key_digest)
-                .bind(&descriptor.payload_id)
-                .bind(descriptor.role.as_db_str())
-                .bind(&descriptor.media_type)
-                .bind(descriptor.compression.as_db_str())
-                .bind(&descriptor.sha256_hex)
-                .bind(descriptor.byte_len as i64)
-                .bind(&payload.body)
-                .execute(&mut *tx)
-                .await?;
-        }
+        upsert_metadata_in_tx(&mut tx, &key_digest, &entry.metadata).await?;
+        upsert_payload_in_tx(&mut tx, &key_digest, &entry.payload).await?;
 
         queries::batch_upsert_tags(&mut tx, &key_digest, &entry.tags)
             .await
@@ -328,11 +247,62 @@ impl PostgresCache {
 
         Ok(())
     }
+
+    /// Upsert metadata only.
+    ///
+    /// This supports incremental enrichment phases that improve page metadata
+    /// without touching the stored payload bytes or tags.
+    pub async fn put_metadata(&self, metadata: &CacheEntryMetadata) -> DbResult<()> {
+        metadata.validate()?;
+
+        let key_digest = cache_key_digest(metadata.key())?;
+
+        let mut tx = self.pool.begin().await?;
+
+        upsert_metadata_in_tx(&mut tx, &key_digest, metadata).await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Upsert the single primary payload only.
+    ///
+    /// The metadata row must already exist because `cache_payloads.key_digest`
+    /// references `cache_entries.key_digest`.
+    pub async fn put_payload(&self, key: &CacheKey, payload: &CachePayload) -> DbResult<()> {
+        payload.validate()?;
+
+        let key_digest = cache_key_digest(key)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        upsert_payload_in_tx(&mut tx, &key_digest, payload).await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Delete the primary payload row for an entry.
+    ///
+    /// This leaves metadata and tags intact. A later full-entry read will report
+    /// the entry as incomplete until a payload is written again.
+    pub async fn delete_payload(&self, key: &CacheKey) -> DbResult<u64> {
+        let key_digest = cache_key_digest(key)?;
+
+        let result = sqlx::query(queries::DELETE_PAYLOAD_FOR_KEY)
+            .bind(&key_digest)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
-// ————————————————————————————————————————————————————————————————————————
-// Tag Operations
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
+// Tag operations
+// -----------------------------------------------------------------------------
 
 impl PostgresCache {
     /// Merge tags onto a cache entry.
@@ -340,6 +310,7 @@ impl PostgresCache {
     /// This is idempotent. Existing associations are left as-is.
     pub async fn add_tags(&self, key: &CacheKey, tags: &[CacheTag]) -> DbResult<()> {
         let key_digest = cache_key_digest(key)?;
+
         let mut tx = self.pool.begin().await?;
 
         queries::batch_upsert_tags(&mut tx, &key_digest, tags)
@@ -361,6 +332,7 @@ impl PostgresCache {
     /// Replace all tags for a cache entry.
     pub async fn replace_tags(&self, key: &CacheKey, tags: &[CacheTag]) -> DbResult<()> {
         let key_digest = cache_key_digest(key)?;
+
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(queries::DELETE_ALL_TAGS_FOR_ENTRY)
@@ -503,18 +475,13 @@ impl PostgresCache {
     pub async fn list_tags_for_entry(&self, key: &CacheKey) -> DbResult<Vec<CacheTag>> {
         let key_digest = cache_key_digest(key)?;
 
-        let rows = sqlx::query(queries::LIST_TAGS_FOR_ENTRY)
-            .bind(&key_digest)
-            .fetch_all(&self.pool)
-            .await?;
-
-        rows_to_tags(rows)
+        self.load_tags_for_digest(&key_digest).await
     }
 }
 
-// ————————————————————————————————————————————————————————————————————————
-// Auxiliary Storage
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
+// Auxiliary storage
+// -----------------------------------------------------------------------------
 
 impl PostgresCache {
     /// Get a JSON auxiliary value for one cache entry.
@@ -592,9 +559,73 @@ impl PostgresCache {
     }
 }
 
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
+// Transaction helpers
+// -----------------------------------------------------------------------------
+
+async fn upsert_metadata_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    key_digest: &str,
+    metadata: &CacheEntryMetadata,
+) -> DbResult<()> {
+    metadata.validate()?;
+
+    let key_json =
+        serde_json::to_value(metadata.key()).map_err(|error| DbError::json(error.to_string()))?;
+
+    let metadata_json =
+        serde_json::to_value(metadata).map_err(|error| DbError::json(error.to_string()))?;
+
+    let capture_policy_json = match &metadata.request.capture_policy {
+        Some(policy) => {
+            serde_json::to_value(policy).map_err(|error| DbError::json(error.to_string()))?
+        }
+        None => serde_json::Value::Null,
+    };
+
+    sqlx::query(queries::UPSERT_CACHE_ENTRY)
+        .bind(key_digest)
+        .bind(&key_json)
+        .bind(metadata.metadata_version as i32)
+        .bind(&metadata.entry_kind)
+        .bind(&metadata.request.requested_url)
+        .bind(&metadata.request.requested_host)
+        .bind(&metadata.response.final_url)
+        .bind(&metadata.response.final_host)
+        .bind(&capture_policy_json)
+        .bind(metadata.stored_at_unix_ms)
+        .bind(metadata.response.status_code.map(i32::from))
+        .bind(&metadata.response.content_type)
+        .bind(&metadata_json)
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+async fn upsert_payload_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    key_digest: &str,
+    payload: &CachePayload,
+) -> DbResult<()> {
+    payload.validate()?;
+
+    sqlx::query(queries::UPSERT_PAYLOAD)
+        .bind(key_digest)
+        .bind(&payload.descriptor.media_type)
+        .bind(payload.descriptor.compression.as_db_str())
+        .bind(&payload.descriptor.sha256_hex)
+        .bind(payload.descriptor.byte_len as i64)
+        .bind(&payload.body)
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Row mapping and stored-data validation helpers
-// ————————————————————————————————————————————————————————————————————————
+// -----------------------------------------------------------------------------
 
 fn rows_to_entry_refs(rows: Vec<PgRow>) -> DbResult<Vec<CacheEntryRef>> {
     let mut refs = Vec::with_capacity(rows.len());
@@ -602,8 +633,11 @@ fn rows_to_entry_refs(rows: Vec<PgRow>) -> DbResult<Vec<CacheEntryRef>> {
     for row in rows {
         let key_json: serde_json::Value = row.try_get("key_json")?;
 
-        let key: CacheKey = serde_json::from_value(key_json)
-            .map_err(|error| DbError::json(error.to_string()))?;
+        let key: CacheKey =
+            serde_json::from_value(key_json).map_err(|error| DbError::json(error.to_string()))?;
+
+        let metadata_version: i32 = row.try_get("metadata_version")?;
+        let status_code: Option<i32> = row.try_get("status_code")?;
 
         refs.push(CacheEntryRef {
             key_digest: row.try_get("key_digest")?,
@@ -612,10 +646,13 @@ fn rows_to_entry_refs(rows: Vec<PgRow>) -> DbResult<Vec<CacheEntryRef>> {
             final_url: row.try_get("final_url")?,
             stored_at_unix_ms: row.try_get("stored_at_unix_ms")?,
             entry_kind: row.try_get("entry_kind")?,
-            metadata_version: row.try_get::<i64, _>("metadata_version")? as u32,
-            status_code: row
-                .try_get::<Option<i64>, _>("status_code")?
-                .map(|code| code as u16),
+            metadata_version: u32::try_from(metadata_version).map_err(|_| {
+                DbError::invariant(format!("invalid metadata_version: {metadata_version}"))
+            })?,
+            status_code: status_code
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|_| DbError::invariant("invalid status_code"))?,
             content_type: row.try_get("content_type")?,
         });
     }
@@ -636,60 +673,58 @@ fn rows_to_tags(rows: Vec<PgRow>) -> DbResult<Vec<CacheTag>> {
     Ok(tags)
 }
 
+fn row_to_payload(row: PgRow) -> DbResult<CachePayload> {
+    let compression: String = row.try_get("compression")?;
+    let byte_len: i64 = row.try_get("byte_len")?;
+
+    let descriptor = CachePayloadDescriptor {
+        media_type: row.try_get("media_type")?,
+        compression: CachePayloadCompression::from_db_str(&compression)?,
+        sha256_hex: row.try_get("sha256_hex")?,
+        byte_len: usize::try_from(byte_len)
+            .map_err(|_| DbError::invariant(format!("invalid payload byte_len: {byte_len}")))?,
+    };
+
+    let body: Vec<u8> = row.try_get("body")?;
+
+    let payload = CachePayload { descriptor, body };
+
+    validate_loaded_payload(&payload)?;
+
+    Ok(payload)
+}
+
 fn validate_loaded_metadata_for_key(
     expected_key: &CacheKey,
     metadata: &CacheEntryMetadata,
 ) -> DbResult<()> {
-    if &metadata.cache_key != expected_key {
+    if metadata.key() != expected_key {
         return Err(DbError::invariant(format!(
             "metadata cache key does not match requested key: metadata={:?} requested={:?}",
-            metadata.cache_key, expected_key
+            metadata.key(),
+            expected_key
         )));
     }
 
-    let key_url = metadata.cache_key.requested_url.as_str();
-    let request_url = metadata.request.requested_url.as_str();
-
-    if key_url != request_url {
-        return Err(DbError::invariant(format!(
-            "metadata request URL does not match cache key URL: request={} key={}",
-            request_url, key_url
-        )));
-    }
-
-    Ok(())
+    validate_loaded_metadata(metadata)
 }
 
-fn validate_payload_body(
-    payload_id: &str,
-    expected_sha256_hex: &str,
-    expected_byte_len: usize,
-    body: &[u8],
-) -> DbResult<()> {
-    if body.len() != expected_byte_len {
-        return Err(DbError::invariant(format!(
-            "payload byte length mismatch for {}: descriptor={} actual={}",
-            payload_id,
-            expected_byte_len,
-            body.len()
-        )));
-    }
+fn validate_loaded_metadata(metadata: &CacheEntryMetadata) -> DbResult<()> {
+    metadata.validate().map_err(invalid_entry_to_invariant)
+}
 
-    let observed_sha256_hex = crate::model::sha256_hex(body);
-
-    if observed_sha256_hex != expected_sha256_hex {
-        return Err(DbError::invariant(format!(
-            "payload checksum mismatch for {}",
-            payload_id
-        )));
-    }
-
-    Ok(())
+fn validate_loaded_payload(payload: &CachePayload) -> DbResult<()> {
+    payload.validate().map_err(invalid_entry_to_invariant)
 }
 
 fn validate_loaded_entry(entry: &CacheEntry) -> DbResult<()> {
-    entry
-        .validate()
-        .map_err(|error| DbError::invariant(error.to_string()))
+    entry.validate().map_err(invalid_entry_to_invariant)
+}
+
+fn invalid_entry_to_invariant(error: DbError) -> DbError {
+    match error {
+        DbError::InvalidEntry(message) => DbError::invariant(message),
+        other => other,
+    }
 }
 

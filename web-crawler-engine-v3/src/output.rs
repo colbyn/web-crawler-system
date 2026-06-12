@@ -36,8 +36,9 @@ use web_browser_driver::{
 use crate::{
     input::CrawlRequest,
     policy::CacheDecision,
-    sqlite_cache::CacheKey,
 };
+
+use web_crawler_db::CacheKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -29,7 +29,7 @@ use url::Url;
 use uuid::Uuid;
 use web_browser_driver::BrowserProfileKey;
 
-use crate::sqlite_cache::CacheTag;
+use web_crawler_db::CacheTag;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

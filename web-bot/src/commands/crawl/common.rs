@@ -34,7 +34,8 @@
 use clap::ValueEnum;
 use serde::Deserialize;
 use serde_json::Value;
-use web_crawler_engine_v3::sqlite_cache::CacheTag;
+// use web_crawler_engine_v3::sqlite_cache::CacheTag;
+use web_crawler_db::CacheTag;
 
 /// Input format accepted by the crawl command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]

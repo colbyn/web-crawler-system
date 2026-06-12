@@ -88,12 +88,13 @@ use crate::{
         CrawlPolicy,
         ScopeDecision,
     },
-    sqlite_cache::CacheTag,
     url::{
         NormalizedUrl,
         UrlNormalizer,
     },
 };
+
+use web_crawler_db::CacheTag;
 
 /// Seed-local crawl budget identity.
 ///

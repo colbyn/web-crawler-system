@@ -1,5 +1,6 @@
 use url::Url;
-use web_crawler_engine_v3::sqlite_cache::CacheTag;
+// use web_crawler_engine_v3::sqlite_cache::CacheTag;
+use web_crawler_db::CacheTag;
 
 pub fn randomize_parsed_seed_order(
     parsed: &mut Vec<(Url, Vec<CacheTag>)>,

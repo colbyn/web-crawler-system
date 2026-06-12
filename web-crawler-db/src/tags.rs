@@ -68,8 +68,8 @@ impl CacheTag {
     /// This is the preferred constructor for application code.
     pub fn new(kind: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
-            kind: normalize_tag_part(kind.into()),
-            key: normalize_tag_part(key.into()),
+            kind: normalize_tag_kind(kind.into()),
+            key: normalize_tag_key(key.into()),
         }
     }
 
@@ -164,6 +164,19 @@ impl From<(&str, &str)> for CacheTag {
     }
 }
 
+fn normalize_tag_kind(raw: String) -> String {
+    normalize_tag_part(raw)
+}
+
+fn normalize_tag_key(raw: String) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "untagged".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Normalize one tag component into a clean lowercase storage key.
 ///
 /// The normalization is deliberately conservative:
@@ -180,7 +193,7 @@ impl From<(&str, &str)> for CacheTag {
 pub(crate) fn normalize_tag_part(raw: String) -> String {
     let normalized = raw
         .trim()
-        .to_ascii_lowercase()
+        // .to_ascii_lowercase()
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric()

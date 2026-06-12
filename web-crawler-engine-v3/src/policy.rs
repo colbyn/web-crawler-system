@@ -1,37 +1,60 @@
 //! Crawler policy.
 //!
 //! Policy modules decide whether the crawler should visit, skip, cache, reuse,
-//! or expand a page. They should operate on generic crawl facts, not app-specific
-//! business rules.
+//! or expand a page. They should operate on generic crawl facts, not
+//! app-specific business rules.
 //!
 //! Examples of appropriate crawler policy:
 //!
 //! - same-domain or same-registrable-domain scope,
 //! - maximum hop depth,
-//! - skip obvious binary assets,
-//! - reject poisoned snapshots,
-//! - recrawl stale or unhealthy cache artifacts.
+//! - skip obvious binary/static assets,
+//! - reject stale or incompatible cache metadata,
+//! - recrawl artifacts produced under older cache policy semantics.
 //!
 //! Examples of inappropriate crawler policy:
 //!
 //! - deciding whether a company is a qualified lead,
 //! - associating a page with a CRM record,
 //! - ranking businesses,
-//! - interpreting service categories.
+//! - interpreting extracted anchors as job postings,
+//! - assigning business-specific categories.
 //!
-//! This crate should expose enough policy hooks for downstream callers without
-//! forcing the browser driver or cache store to know crawler intent.
+//! This crate should expose enough generic policy hooks for downstream callers
+//! without forcing the browser driver or artifact cache to understand crawler
+//! intent.
+//!
+//! ## Extraction versus expansion
+//!
+//! Anchor extraction is page evidence. Frontier expansion is scheduling.
+//!
+//! A crawl with `max_hop_depth = 0` may still extract and persist anchors from
+//! landing pages for downstream analysis. The hop-depth limit only prevents
+//! those anchors from becoming follow-up requests.
+//!
+//! ## Cache policy
+//!
+//! Cache acceptance is intentionally metadata-only.
+//!
+//! Warm-cache replay should inspect cache metadata, extracted replay JSON, and
+//! payload descriptors. It should not load large payload bodies such as rendered
+//! HTML just to decide whether an artifact is usable.
 
 use serde::{
     Deserialize,
     Serialize,
 };
 use url::Url;
+use web_crawler_db::{
+    now_unix_ms,
+    CacheEntryMetadata,
+    CACHE_ENTRY_KIND_PAGE,
+    CACHE_METADATA_VERSION,
+};
 
 use crate::{
     config::CrawlLimits,
     input::CrawlRequest,
-    sqlite_cache::{CacheEntry, CACHE_ENTRY_KIND_PAGE, CACHE_METADATA_VERSION},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +85,7 @@ impl Default for CachePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum CacheDecision {
     Use,
+
     Reject {
         reason: String,
     },
@@ -128,14 +152,17 @@ impl Default for VisitPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SnapshotPolicy {
+    /// Whether live browser captures should persist rendered HTML snapshots.
+    ///
+    /// This controls snapshot capture only. It does not control page-info or
+    /// anchor extraction. Anchors remain useful landing-page evidence even when
+    /// the crawl depth prevents following them.
     pub capture_html: bool,
 }
 
 impl Default for SnapshotPolicy {
     fn default() -> Self {
-        Self {
-            capture_html: true,
-        }
+        Self { capture_html: true }
     }
 }
 
@@ -143,6 +170,7 @@ impl Default for SnapshotPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ScopeDecision {
     InScope,
+
     OutOfScope {
         reason: String,
     },
@@ -152,6 +180,7 @@ pub enum ScopeDecision {
 #[serde(rename_all = "snake_case")]
 pub enum VisitDecision {
     Visit,
+
     Skip {
         reason: String,
     },
@@ -216,9 +245,15 @@ impl CrawlPolicy {
         }
     }
 
-    pub fn evaluate_cache(&self, entry: &CacheEntry) -> CacheDecision {
-        let metadata = &entry.metadata;
-
+    /// Evaluate whether cache metadata can be replayed as page evidence.
+    ///
+    /// This check intentionally accepts metadata rather than a full cache entry.
+    /// The replay path should not load HTML payload bytes just to decide whether a
+    /// cached artifact is usable.
+    pub fn evaluate_cache_metadata(
+        &self,
+        metadata: &CacheEntryMetadata,
+    ) -> CacheDecision {
         if metadata.metadata_version != CACHE_METADATA_VERSION {
             return CacheDecision::Reject {
                 reason: format!(
@@ -246,7 +281,8 @@ impl CrawlPolicy {
         }
 
         if let Some(max_age_ms) = self.cache.max_age_ms {
-            let age_ms = crate::sqlite_cache::now_unix_ms() - metadata.stored_at_unix_ms;
+            let age_ms = now_unix_ms() - metadata.stored_at_unix_ms;
+
             if age_ms > max_age_ms {
                 return CacheDecision::Reject {
                     reason: format!("cache age {}ms exceeds max {}ms", age_ms, max_age_ms),
@@ -254,9 +290,15 @@ impl CrawlPolicy {
             }
         }
 
-        if metadata.primary_payload().is_none() {
+        if metadata.resolution.is_none() {
             return CacheDecision::Reject {
-                reason: "cache entry has no primary payload".into(),
+                reason: "cache metadata has no URL resolution facts".into(),
+            };
+        }
+
+        if metadata.telemetry.is_none() {
+            return CacheDecision::Reject {
+                reason: "cache metadata has no page telemetry".into(),
             };
         }
 
@@ -272,9 +314,25 @@ fn looks_like_common_binary_asset(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
 
     [
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".pdf", ".zip",
-        ".tar", ".gz", ".mp4", ".mov", ".mp3", ".woff", ".woff2", ".ttf",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".webp",
+        ".svg",
+        ".ico",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".mp4",
+        ".mov",
+        ".mp3",
+        ".woff",
+        ".woff2",
+        ".ttf",
     ]
     .iter()
     .any(|suffix| path.ends_with(suffix))
 }
+

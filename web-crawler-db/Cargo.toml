@@ -19,8 +19,9 @@ thiserror = "1.0"
 tracing = "0.1"
 url = { version = "2.5", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "macros"] }  # for tests/examples if needed
+web-browser-driver = { path = "../web-browser-driver" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "migrate"] }
+sqlx = { workspace = true }
 

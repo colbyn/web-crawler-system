@@ -1,79 +1,26 @@
 //! Explicit schema setup for the `web-crawler-db` artifact cache.
 //!
-//! Ordinary database connections must not create or migrate schema as a side
-//! effect. Crawlers, workers, and services should be able to connect without
-//! unexpectedly changing database structure.
+//! This module owns the **intentional** migration path.
 //!
-//! This module owns the explicit migration/setup path:
-//!
-//! ```text
-//! connect -> use cache
-//! migrate -> intentional admin/setup operation
-//! ```
-//!
-//! The current implementation runs idempotent `CREATE TABLE IF NOT EXISTS` and
-//! `CREATE INDEX IF NOT EXISTS` statements from `queries::schema`. That is good
-//! enough for the crate's early schema bootstrap phase.
-//!
-//! Later, this module is the place to replace that bootstrap behavior with a
-//! true versioned migration system, such as sqlx migrations, without changing
-//! the runtime cache API.
-//!
-//! Intended callers:
-//!
-//! - a future `web-crawler-db migrate` CLI command,
-//! - tests,
-//! - local setup scripts,
-//! - explicit administrative tooling.
-//!
-//! Non-callers:
-//!
-//! - `PostgresCache::connect()`,
-//! - crawler hot paths,
-//! - worker startup paths that should not mutate schema.
+//! Normal cache connections must never mutate schema as a side effect.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-
 use crate::error::{DbError, DbResult};
 use crate::queries;
 
-/// Create or update the database schema using an existing Postgres pool.
+/// Apply the full schema to an existing pool.
 ///
-/// This function is explicit by design. It is not called by
-/// `PostgresCache::connect()`.
+/// Uses `raw_sql` so we can execute the entire `sql/schema.sql` file
+/// (multiple statements) in one go.
 pub async fn migrate_pool(pool: &PgPool) -> DbResult<()> {
-    use queries::schema::*;
-
-    let statements = [
-        CREATE_TABLE_CACHE_ENTRIES,
-        CREATE_INDEX_REQUESTED_HOST,
-        CREATE_INDEX_FINAL_HOST,
-        CREATE_INDEX_STORED_AT,
-        CREATE_INDEX_ENTRY_KIND,
-        CREATE_TABLE_CACHE_PAYLOADS,
-        CREATE_INDEX_PAYLOADS_KEY_DIGEST,
-        CREATE_INDEX_PAYLOADS_ROLE,
-        CREATE_TABLE_CACHE_TAGS,
-        CREATE_INDEX_TAGS_KIND,
-        CREATE_TABLE_CACHE_ENTRY_TAGS,
-        CREATE_INDEX_ENTRY_TAGS_KEY_DIGEST,
-        CREATE_INDEX_ENTRY_TAGS_KIND,
-        CREATE_INDEX_ENTRY_TAGS_TAG,
-        CREATE_TABLE_CACHE_AUXILIARY,
-    ];
-
-    for statement in statements {
-        sqlx::query(statement).execute(pool).await?;
-    }
-
+    sqlx::raw_sql(queries::SCHEMA)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
-/// Connect to a database URL, run explicit schema setup, and close the pool when
-/// the returned pool is dropped.
-///
-/// This helper is intended for CLI/admin setup flows.
+/// Connect to a database URL, apply schema, and return a pool.
 pub async fn migrate_database_url(database_url: &str) -> DbResult<()> {
     let pool = connect_migration_pool(database_url).await?;
     migrate_pool(&pool).await?;
@@ -93,4 +40,3 @@ async fn connect_migration_pool(database_url: &str) -> DbResult<PgPool> {
 
     Ok(pool)
 }
-

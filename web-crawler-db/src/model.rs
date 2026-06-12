@@ -3,26 +3,29 @@
 //! This module defines the storage-agnostic Rust shapes used by the Postgres
 //! implementation.
 //!
-//! The cache model has four layers:
+//! The cache model is intentionally simple:
 //!
 //! - [`CacheKey`] identifies the requested URL being cached.
-//! - [`CacheEntryMetadata`] stores durable, queryable, JSON-friendly provenance
-//!   and extracted replay data.
-//! - [`CachePayload`] stores artifact bytes such as rendered HTML, raw response
-//!   bodies, screenshots, or future binary/text artifacts.
-//! - [`CacheTag`] stores secondary-index associations to caller-owned concepts
-//!   such as entities, categories, batches, datasets, or campaigns.
+//! - [`CacheEntryMetadata`] stores durable, JSON-friendly page provenance and
+//!   extracted replay data.
+//! - [`CachePayload`] stores the single primary artifact body for the entry.
+//! - [`CacheTag`] stores secondary-index associations to caller-owned concepts.
 //!
-//! A crucial invariant is that payload descriptors in metadata must match the
-//! actual payload list exactly. Metadata describes payloads; payload rows store
-//! bytes. If those drift apart, cache replay becomes haunted furniture.
+//! This crate currently supports one payload per cache entry. That keeps the
+//! API aligned with the real crawler path: one requested URL / page artifact
+//! maps to one primary stored body.
 //!
-//! New write paths should prefer [`CacheEntry::new_page`], which derives
-//! metadata payload descriptors from the supplied payloads. Lower-level callers
-//! may still construct structs directly, but [`CacheEntry::validate`] should be
-//! called before persistence.
-
-use std::collections::HashSet;
+//! Multi-payload support, such as screenshots, raw response bodies, rendered
+//! HTML, network logs, or other artifacts attached to the same cache entry,
+//! should be added later as an explicit schema/API migration if a real caller
+//! needs it.
+//!
+//! Metadata and bytes are deliberately separate:
+//!
+//! - metadata-only reads avoid loading large `BYTEA` payloads,
+//! - payload reads can verify checksum and byte length,
+//! - full-entry reads combine metadata, payload, and tags for inspection or
+//!   replay.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,20 +33,24 @@ use crate::error::{DbError, DbResult};
 use crate::key::CacheKey;
 pub use crate::tags::CacheTag;
 
+use web_browser_driver::{
+    ExtractedAnchor, NonCriticalBrowserError, PageInfo, PageTelemetry, UrlResolution,
+};
+
 /// Entry kind used for ordinary crawled page artifacts.
 pub const CACHE_ENTRY_KIND_PAGE: &str = "page";
 
 /// Current metadata shape version.
 ///
-/// This version describes the JSON metadata contract, not the cache-key digest
-/// contract and not the SQL schema version.
-pub const CACHE_METADATA_VERSION: u32 = 1;
+/// Bump this when the persisted shape of [`CacheEntryMetadata`] changes in a
+/// backward-incompatible way.
+pub const CACHE_METADATA_VERSION: u32 = 3;
 
 /// Versioned metadata for a cached artifact.
 ///
-/// Metadata is intentionally JSON-friendly because it is stored as JSONB in
-/// Postgres. Large artifact bytes should not be embedded here. Put bytes in
-/// [`CachePayload`] rows and keep only descriptors in `payloads`.
+/// Metadata is stored as JSONB in Postgres. Large artifact bytes should not be
+/// embedded here. The primary body lives in [`CachePayload`] and the
+/// `cache_payloads` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheEntryMetadata {
@@ -55,31 +62,35 @@ pub struct CacheEntryMetadata {
     pub request: CacheRequestInfo,
     pub response: CacheResponseInfo,
 
+    /// Low-level browser telemetry captured while opening the page.
     #[serde(default)]
-    pub telemetry_json: serde_json::Value,
+    pub telemetry: Option<PageTelemetry>,
 
+    /// Page-level metadata extracted from the DOM.
     #[serde(default)]
-    pub extracted_json: serde_json::Value,
+    pub page_info: Option<PageInfo>,
 
+    /// Anchors discovered on the page.
     #[serde(default)]
-    pub non_critical_errors_json: Vec<serde_json::Value>,
+    pub anchors: Vec<ExtractedAnchor>,
 
+    /// URL resolution facts, including requested URL, final URL, and redirects.
     #[serde(default)]
-    pub payloads: Vec<CachePayloadDescriptor>,
+    pub resolution: Option<UrlResolution>,
+
+    /// Non-critical browser/page errors observed during the visit.
+    #[serde(default)]
+    pub non_critical_errors: Vec<NonCriticalBrowserError>,
 }
 
 impl CacheEntryMetadata {
-    /// Construct metadata for a page artifact from explicit payload descriptors.
-    ///
-    /// Most write paths should prefer [`CacheEntry::new_page`], which derives
-    /// descriptors from actual payloads and validates the finished entry.
+    /// Construct metadata for an ordinary page artifact.
     pub fn new_page(
         cache_key: CacheKey,
         stored_at_unix_ms: i64,
         producer: CacheProducerInfo,
         request: CacheRequestInfo,
         response: CacheResponseInfo,
-        payloads: Vec<CachePayloadDescriptor>,
     ) -> Self {
         Self {
             metadata_version: CACHE_METADATA_VERSION,
@@ -89,49 +100,63 @@ impl CacheEntryMetadata {
             producer,
             request,
             response,
-            telemetry_json: serde_json::Value::Null,
-            extracted_json: serde_json::Value::Null,
-            non_critical_errors_json: Vec::new(),
-            payloads,
+            telemetry: None,
+            page_info: None,
+            anchors: Vec::new(),
+            resolution: None,
+            non_critical_errors: Vec::new(),
         }
     }
 
-    /// Construct metadata for a page artifact by deriving descriptors from
-    /// actual payloads.
-    pub fn new_page_from_payloads(
-        cache_key: CacheKey,
-        stored_at_unix_ms: i64,
-        producer: CacheProducerInfo,
-        request: CacheRequestInfo,
-        response: CacheResponseInfo,
-        payloads: &[CachePayload],
-    ) -> Self {
-        Self::new_page(
-            cache_key,
-            stored_at_unix_ms,
-            producer,
-            request,
-            response,
-            payloads
-                .iter()
-                .map(|payload| payload.descriptor.clone())
-                .collect(),
-        )
+    /// Borrow the cache key.
+    pub fn key(&self) -> &CacheKey {
+        &self.cache_key
     }
 
-    /// Return the preferred primary payload descriptor for replay.
+    /// Validate metadata-only invariants.
     ///
-    /// `PrimarySnapshot` is preferred. `ResponseBody` is a fallback so older or
-    /// alternate capture strategies can still provide a main body artifact.
-    pub fn primary_payload(&self) -> Option<&CachePayloadDescriptor> {
-        self.payloads
-            .iter()
-            .find(|p| p.role == CachePayloadRole::PrimarySnapshot)
-            .or_else(|| {
-                self.payloads
-                    .iter()
-                    .find(|p| p.role == CachePayloadRole::ResponseBody)
-            })
+    /// This is intentionally narrower than [`CacheEntry::validate`]. It is used
+    /// by metadata-only update/read paths that should not require payload bytes.
+    pub fn validate(&self) -> DbResult<()> {
+        if self.metadata_version != CACHE_METADATA_VERSION {
+            return Err(DbError::invalid_entry(format!(
+                "unsupported metadata version {}; expected {}",
+                self.metadata_version, CACHE_METADATA_VERSION
+            )));
+        }
+
+        if self.entry_kind.trim().is_empty() {
+            return Err(DbError::invalid_entry("entry_kind must not be empty"));
+        }
+
+        if self.stored_at_unix_ms < 0 {
+            return Err(DbError::invalid_entry(
+                "stored_at_unix_ms must not be negative",
+            ));
+        }
+
+        validate_non_empty("producer.engine_name", &self.producer.engine_name)?;
+        validate_non_empty("producer.engine_version", &self.producer.engine_version)?;
+
+        let key_url = self.cache_key.requested_url.as_str();
+        let request_url = self.request.requested_url.as_str();
+
+        if key_url != request_url {
+            return Err(DbError::invalid_entry(format!(
+                "request URL does not match cache key URL: request={} key={}",
+                request_url, key_url
+            )));
+        }
+
+        let expected_host = self.cache_key.requested_host();
+        if self.request.requested_host != expected_host {
+            return Err(DbError::invalid_entry(format!(
+                "requested_host does not match cache key host: request={:?} key={:?}",
+                self.request.requested_host, expected_host
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -149,9 +174,8 @@ pub struct CacheProducerInfo {
 ///
 /// This is not cache identity. Identity lives in [`CacheKey`].
 ///
-/// `capture_policy_json` records producer/browser/profile/policy details that
-/// may explain how the artifact was captured. It is intentionally provenance,
-/// not key material.
+/// `capture_policy` records producer/browser/profile/policy details that may
+/// explain how the artifact was captured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheRequestInfo {
@@ -159,18 +183,27 @@ pub struct CacheRequestInfo {
     pub requested_host: Option<String>,
 
     #[serde(default)]
-    pub capture_policy_json: serde_json::Value,
+    pub capture_policy: Option<CacheCapturePolicy>,
 }
 
 impl CacheRequestInfo {
-    /// Build request provenance from a cache key and capture-policy JSON.
-    pub fn from_key(cache_key: &CacheKey, capture_policy_json: serde_json::Value) -> Self {
+    /// Build request provenance from a cache key and capture policy.
+    pub fn from_key(cache_key: &CacheKey, capture_policy: Option<CacheCapturePolicy>) -> Self {
         Self {
             requested_url: cache_key.requested_url.to_string(),
             requested_host: cache_key.requested_host(),
-            capture_policy_json,
+            capture_policy,
         }
     }
+}
+
+/// Lightweight policy snapshot stored with each cache entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CacheCapturePolicy {
+    pub browser_profile_key: String,
+    pub cache_policy_version: u32,
+    pub capture_html: bool,
 }
 
 /// Response-side provenance for a cache artifact.
@@ -183,47 +216,43 @@ pub struct CacheResponseInfo {
     pub content_type: Option<String>,
 }
 
-/// Metadata descriptor for one stored payload.
+/// Descriptor for the single stored payload.
 ///
-/// Descriptors live inside [`CacheEntryMetadata`]. Payload bytes live in
-/// [`CachePayload`].
+/// The descriptor describes the bytes exactly as stored in Postgres. If
+/// compression is not [`CachePayloadCompression::None`], `sha256_hex` and
+/// `byte_len` describe the compressed byte sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CachePayloadDescriptor {
-    pub payload_id: String,
-    pub role: CachePayloadRole,
     pub media_type: Option<String>,
     pub compression: CachePayloadCompression,
     pub sha256_hex: String,
     pub byte_len: usize,
 }
 
-/// Semantic role of a payload within a cache entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CachePayloadRole {
-    PrimarySnapshot,
-    ResponseBody,
-    Screenshot,
-    Other,
-}
-
-impl CachePayloadRole {
-    /// Return the stable database representation for this role.
-    pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::PrimarySnapshot => "primary_snapshot",
-            Self::ResponseBody => "response_body",
-            Self::Screenshot => "screenshot",
-            Self::Other => "other",
+impl CachePayloadDescriptor {
+    /// Validate descriptor-only invariants.
+    pub fn validate(&self) -> DbResult<()> {
+        if let Some(media_type) = &self.media_type {
+            validate_non_empty("payload.media_type", media_type)?;
         }
+
+        if self.sha256_hex.len() != 64
+            || !self
+                .sha256_hex
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        {
+            return Err(DbError::invalid_entry(
+                "payload has invalid sha256 hex digest",
+            ));
+        }
+
+        Ok(())
     }
 }
 
-/// Compression state of the bytes stored in a payload row.
-///
-/// `sha256_hex` and `byte_len` in [`CachePayloadDescriptor`] describe the bytes
-/// as stored, not necessarily the decoded/original body.
+/// Compression state of the bytes stored in the payload row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CachePayloadCompression {
@@ -241,13 +270,21 @@ impl CachePayloadCompression {
             Self::Zstd => "zstd",
         }
     }
+
+    /// Parse the stable database representation for this compression mode.
+    pub fn from_db_str(value: &str) -> DbResult<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "gzip" => Ok(Self::Gzip),
+            "zstd" => Ok(Self::Zstd),
+            other => Err(DbError::invariant(format!(
+                "unknown payload compression mode: {other}"
+            ))),
+        }
+    }
 }
 
-/// One cache payload and its descriptor.
-///
-/// The descriptor is computed when the payload is constructed. If callers mutate
-/// fields manually, [`CacheEntry::validate`] will catch descriptor/body drift
-/// before persistence.
+/// The single primary payload body for a cache entry.
 #[derive(Debug, Clone)]
 pub struct CachePayload {
     pub descriptor: CachePayloadDescriptor,
@@ -259,8 +296,6 @@ impl CachePayload {
     ///
     /// The checksum and byte length are computed from `body` as supplied.
     pub fn new(
-        payload_id: impl Into<String>,
-        role: CachePayloadRole,
         media_type: Option<String>,
         compression: CachePayloadCompression,
         body: Vec<u8>,
@@ -270,8 +305,6 @@ impl CachePayload {
 
         Self {
             descriptor: CachePayloadDescriptor {
-                payload_id: payload_id.into(),
-                role,
                 media_type,
                 compression,
                 sha256_hex,
@@ -281,184 +314,79 @@ impl CachePayload {
         }
     }
 
-    /// Borrow the payload ID.
-    pub fn payload_id(&self) -> &str {
-        &self.descriptor.payload_id
+    /// Validate descriptor/body consistency.
+    pub fn validate(&self) -> DbResult<()> {
+        self.descriptor.validate()?;
+
+        if self.descriptor.byte_len != self.body.len() {
+            return Err(DbError::invalid_entry(format!(
+                "payload byte length mismatch: descriptor={} actual={}",
+                self.descriptor.byte_len,
+                self.body.len()
+            )));
+        }
+
+        let observed_sha256_hex = sha256_hex(&self.body);
+
+        if self.descriptor.sha256_hex != observed_sha256_hex {
+            return Err(DbError::invalid_entry("payload checksum mismatch"));
+        }
+
+        Ok(())
     }
 }
 
 /// A complete cache entry.
 ///
-/// This includes metadata, payload bytes, and secondary-index tags. Hot replay
-/// paths should usually read metadata only and fetch payload bytes only when
-/// needed.
+/// This combines metadata, the single primary payload body, and secondary-index
+/// tags. Hot replay paths may read metadata only and fetch payload bytes only
+/// when needed.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub metadata: CacheEntryMetadata,
-    pub payloads: Vec<CachePayload>,
+    pub payload: CachePayload,
     pub tags: Vec<CacheTag>,
 }
 
 impl CacheEntry {
     /// Construct a validated page cache entry.
-    ///
-    /// Payload descriptors are derived from `payloads`, which prevents metadata
-    /// and payload bytes from drifting apart at construction time.
     pub fn new_page(
         cache_key: CacheKey,
         stored_at_unix_ms: i64,
         producer: CacheProducerInfo,
         request: CacheRequestInfo,
         response: CacheResponseInfo,
-        payloads: Vec<CachePayload>,
+        payload: CachePayload,
         tags: Vec<CacheTag>,
     ) -> DbResult<Self> {
-        let metadata = CacheEntryMetadata::new_page_from_payloads(
+        let metadata = CacheEntryMetadata::new_page(
             cache_key,
             stored_at_unix_ms,
             producer,
             request,
             response,
-            &payloads,
         );
 
         let entry = Self {
             metadata,
-            payloads,
+            payload,
             tags,
         };
 
         entry.validate()?;
+
         Ok(entry)
     }
 
     /// Borrow the cache key.
     pub fn key(&self) -> &CacheKey {
-        &self.metadata.cache_key
+        self.metadata.key()
     }
 
     /// Validate entry-level invariants before persistence.
-    ///
-    /// This protects the database from caller-created impossible states.
     pub fn validate(&self) -> DbResult<()> {
-        self.validate_metadata_identity()?;
-        self.validate_payloads()?;
-        Ok(())
-    }
-
-    fn validate_metadata_identity(&self) -> DbResult<()> {
-        if self.metadata.metadata_version != CACHE_METADATA_VERSION {
-            return Err(DbError::invalid_entry(format!(
-                "unsupported metadata version {}; expected {}",
-                self.metadata.metadata_version, CACHE_METADATA_VERSION
-            )));
-        }
-
-        if self.metadata.entry_kind.trim().is_empty() {
-            return Err(DbError::invalid_entry("entry_kind must not be empty"));
-        }
-
-        let key_url = self.metadata.cache_key.requested_url.as_str();
-        let request_url = self.metadata.request.requested_url.as_str();
-
-        if key_url != request_url {
-            return Err(DbError::invalid_entry(format!(
-                "request URL does not match cache key URL: request={} key={}",
-                request_url, key_url
-            )));
-        }
-
-        let expected_host = self.metadata.cache_key.requested_host();
-        if self.metadata.request.requested_host != expected_host {
-            return Err(DbError::invalid_entry(format!(
-                "requested_host does not match cache key host: request={:?} key={:?}",
-                self.metadata.request.requested_host, expected_host
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn validate_payloads(&self) -> DbResult<()> {
-        let mut payload_ids = HashSet::new();
-
-        for payload in &self.payloads {
-            validate_payload_descriptor(&payload.descriptor)?;
-
-            if !payload_ids.insert(payload.descriptor.payload_id.as_str()) {
-                return Err(DbError::invalid_entry(format!(
-                    "duplicate payload id in payload list: {}",
-                    payload.descriptor.payload_id
-                )));
-            }
-
-            if payload.descriptor.byte_len != payload.body.len() {
-                return Err(DbError::invalid_entry(format!(
-                    "payload byte length mismatch for {}: descriptor={} actual={}",
-                    payload.descriptor.payload_id,
-                    payload.descriptor.byte_len,
-                    payload.body.len()
-                )));
-            }
-
-            let observed_sha256_hex = sha256_hex(&payload.body);
-            if payload.descriptor.sha256_hex != observed_sha256_hex {
-                return Err(DbError::invalid_entry(format!(
-                    "payload checksum mismatch for {}",
-                    payload.descriptor.payload_id
-                )));
-            }
-        }
-
-        let mut descriptor_ids = HashSet::new();
-
-        for descriptor in &self.metadata.payloads {
-            validate_payload_descriptor(descriptor)?;
-
-            if !descriptor_ids.insert(descriptor.payload_id.as_str()) {
-                return Err(DbError::invalid_entry(format!(
-                    "duplicate payload id in metadata descriptors: {}",
-                    descriptor.payload_id
-                )));
-            }
-        }
-
-        if self.metadata.payloads.len() != self.payloads.len() {
-            return Err(DbError::invalid_entry(format!(
-                "metadata payload descriptor count {} does not match payload count {}",
-                self.metadata.payloads.len(),
-                self.payloads.len()
-            )));
-        }
-
-        for descriptor in &self.metadata.payloads {
-            let Some(payload) = self
-                .payloads
-                .iter()
-                .find(|payload| payload.descriptor.payload_id == descriptor.payload_id)
-            else {
-                return Err(DbError::invalid_entry(format!(
-                    "metadata descriptor has no matching payload body: {}",
-                    descriptor.payload_id
-                )));
-            };
-
-            if descriptor != &payload.descriptor {
-                return Err(DbError::invalid_entry(format!(
-                    "metadata descriptor does not match payload descriptor: {}",
-                    descriptor.payload_id
-                )));
-            }
-        }
-
-        if self.metadata.entry_kind == CACHE_ENTRY_KIND_PAGE
-            && self.metadata.primary_payload().is_none()
-        {
-            return Err(DbError::invalid_entry(
-                "page cache entry must include a primary_snapshot or response_body payload",
-            ));
-        }
-
+        self.metadata.validate()?;
+        self.payload.validate()?;
         Ok(())
     }
 }
@@ -487,21 +415,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn validate_payload_descriptor(descriptor: &CachePayloadDescriptor) -> DbResult<()> {
-    if descriptor.payload_id.trim().is_empty() {
-        return Err(DbError::invalid_entry("payload_id must not be empty"));
-    }
-
-    if descriptor.sha256_hex.len() != 64
-        || !descriptor
-            .sha256_hex
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit())
-    {
-        return Err(DbError::invalid_entry(format!(
-            "payload {} has invalid sha256 hex digest",
-            descriptor.payload_id
-        )));
+fn validate_non_empty(field: &str, value: &str) -> DbResult<()> {
+    if value.trim().is_empty() {
+        return Err(DbError::invalid_entry(format!("{field} must not be empty")));
     }
 
     Ok(())
