@@ -39,7 +39,7 @@ use sqlx::{Postgres, QueryBuilder, Transaction};
 use crate::tags::CacheTag as Tag;
 
 /// The complete schema in dependency order.
-pub const SCHEMA: &str = include_str!("../sql/schema.sql");
+pub const SCHEMA: &str = include_str!("sql/schema.sql");
 
 // -----------------------------------------------------------------------------
 // Core entry operations
