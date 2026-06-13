@@ -53,6 +53,7 @@ use std::{
     time::Duration,
 };
 
+use colored_json::Paint;
 use serde::{
     de::DeserializeOwned,
     Serialize,
@@ -108,10 +109,14 @@ where
         assignment: BrowserProfileAssignment,
         session: Arc<BrowserSession>,
     ) -> CrawlEngineResult<CrawlPageResult<P>> {
-        tracing::debug!(
-            requested_url = %request.requested_url,
-            "opening live page"
-        );
+        eprintln!("{}", format!(
+            "→ {}",
+            request.requested_url.magenta(),
+        ).cyan());
+        // tracing::debug!(
+        //     requested_url = %request.requested_url,
+        //     "opening live page"
+        // );
 
         let open_options = OpenPageOptions::new(request.requested_url.clone())
             .with_max_timeout(self.config.page_open_timeout)
