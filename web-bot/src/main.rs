@@ -15,6 +15,7 @@
 use clap::{
     Parser,
     Subcommand,
+    ValueEnum,
 };
 use std::path::PathBuf;
 
@@ -48,6 +49,16 @@ enum Commands {
         #[command(subcommand)]
         action: commands::db::DbCommands,
     },
+    Doc {
+        #[arg(long)]
+        r#type: SchemaType,
+    }
+}
+
+/// Shared sort direction for list-style commands.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaType {
+    ExtractedAnchor,
 }
 
 #[tokio::main]
@@ -87,6 +98,17 @@ async fn main() -> anyhow::Result<()> {
                     "No database URL provided. Use --database-url or set DATABASE_URL"
                 ))?;
             commands::db::run(action, db_url).await?
+        }
+        Commands::Doc { r#type } => {
+            let schema = match r#type {
+                SchemaType::ExtractedAnchor => {
+                    schemars::schema_for!(
+                        web_browser_driver::ExtractedAnchor
+                    )
+                }
+            };
+            let schema = serde_json::to_string_pretty(&schema).unwrap();
+            println!("{schema}");
         }
     }
 

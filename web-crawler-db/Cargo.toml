@@ -20,6 +20,7 @@ tracing = "0.1"
 url = { version = "2.5", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "macros"] }  # for tests/examples if needed
 web-browser-driver = { path = "../web-browser-driver" }
+schemars = { version = "1.2.1", features = ["derive", "indexmap2", "url2"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

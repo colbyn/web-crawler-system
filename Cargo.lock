@@ -1639,6 +1639,7 @@ dependencies = [
  "schemars_derive",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -2655,6 +2656,7 @@ dependencies = [
  "clap",
  "colored",
  "colored_json",
+ "schemars",
  "serde",
  "serde_json",
  "sqlx",
@@ -2693,6 +2695,7 @@ name = "web-crawler-db"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -2716,6 +2719,7 @@ dependencies = [
  "futures",
  "hex",
  "indexmap",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

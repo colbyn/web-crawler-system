@@ -16,6 +16,7 @@ anyhow = "1"
 walkdir = "2.5.0"
 colored = "3.0.0"
 colored_json = "5.0.0"
+schemars = { version = "1.2.1", features = ["derive", "indexmap2", "url2"] }
 
 web-crawler-engine-v3 = { path = "../web-crawler-engine-v3" }
 web-browser-driver = { path = "../web-browser-driver" }

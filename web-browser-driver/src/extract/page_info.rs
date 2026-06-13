@@ -14,13 +14,14 @@ use serde::{
     Serialize,
 };
 use url::Url;
+use schemars::JsonSchema;
 
 use crate::{
     BrowserDriverResult,
     BrowserPage,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct PageInfo {
     pub title: Option<String>,
@@ -30,7 +31,7 @@ pub struct PageInfo {
     pub headings: Vec<Heading>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct Heading {
     pub level: u8,

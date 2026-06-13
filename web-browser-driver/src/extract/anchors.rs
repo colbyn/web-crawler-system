@@ -19,13 +19,14 @@ use serde::{
     Serialize,
 };
 use url::Url;
+use schemars::JsonSchema;
 
 use crate::{
     BrowserDriverResult,
     BrowserPage,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct ExtractedAnchor {
     /// Position in document order.
