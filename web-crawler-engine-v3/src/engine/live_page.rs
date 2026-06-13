@@ -53,7 +53,6 @@ use std::{
     time::Duration,
 };
 
-use colored_json::Paint;
 use serde::{
     de::DeserializeOwned,
     Serialize,
