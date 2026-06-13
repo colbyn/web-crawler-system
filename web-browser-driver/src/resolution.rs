@@ -24,8 +24,9 @@ use serde::{
     Serialize,
 };
 use url::Url;
+use schemars::JsonSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct UrlResolution {
     /// URL the caller requested.
@@ -68,7 +69,7 @@ impl UrlResolution {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct RedirectHop {
     pub from_url: Url,

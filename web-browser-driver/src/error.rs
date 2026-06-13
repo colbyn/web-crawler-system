@@ -23,6 +23,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use schemars::JsonSchema;
 use thiserror::Error;
 
 pub type BrowserDriverResult<T> = Result<T, BrowserDriverError>;
@@ -137,7 +138,7 @@ impl BrowserDriverError {
 ///
 /// These should usually be attached to the page result and passed upward. The
 /// crawler/app layer can decide whether they matter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct NonCriticalBrowserError {
     pub kind: NonCriticalBrowserErrorKind,
@@ -153,7 +154,7 @@ impl NonCriticalBrowserError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NonCriticalBrowserErrorKind {
     Console,

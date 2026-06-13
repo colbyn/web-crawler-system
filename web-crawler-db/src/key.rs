@@ -23,6 +23,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use schemars::JsonSchema;
 
 use crate::error::{DbError, DbResult};
 
@@ -45,7 +46,7 @@ const CACHE_KEY_DIGEST_VERSION: u32 = 1;
 ///
 /// Those values may exist elsewhere as provenance, tags, or higher-level task
 /// state, but they are not part of this first cache identity model.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheKey {
     pub requested_url: Url,

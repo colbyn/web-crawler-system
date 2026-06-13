@@ -28,7 +28,7 @@
 //!   replay.
 
 use serde::{Deserialize, Serialize};
-
+use schemars::JsonSchema;
 use crate::error::{DbError, DbResult};
 use crate::key::CacheKey;
 pub use crate::tags::CacheTag;
@@ -51,7 +51,7 @@ pub const CACHE_METADATA_VERSION: u32 = 3;
 /// Metadata is stored as JSONB in Postgres. Large artifact bytes should not be
 /// embedded here. The primary body lives in [`CachePayload`] and the
 /// `cache_payloads` table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheEntryMetadata {
     pub metadata_version: u32,
@@ -161,7 +161,7 @@ impl CacheEntryMetadata {
 }
 
 /// Information about the producer that created the cache artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheProducerInfo {
     pub engine_name: String,
@@ -176,7 +176,7 @@ pub struct CacheProducerInfo {
 ///
 /// `capture_policy` records producer/browser/profile/policy details that may
 /// explain how the artifact was captured.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheRequestInfo {
     pub requested_url: String,
@@ -198,7 +198,7 @@ impl CacheRequestInfo {
 }
 
 /// Lightweight policy snapshot stored with each cache entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheCapturePolicy {
     pub browser_profile_key: String,
@@ -207,7 +207,7 @@ pub struct CacheCapturePolicy {
 }
 
 /// Response-side provenance for a cache artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheResponseInfo {
     pub final_url: Option<String>,
@@ -394,7 +394,7 @@ impl CacheEntry {
 /// Lightweight reference to a cache entry for list/query APIs.
 ///
 /// This avoids loading payload bodies when callers only need entry metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CacheEntryRef {
     pub key_digest: String,

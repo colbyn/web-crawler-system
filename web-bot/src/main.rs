@@ -58,7 +58,12 @@ enum Commands {
 /// Shared sort direction for list-style commands.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaType {
+    #[value(alias("ExtractedAnchor"))]
     ExtractedAnchor,
+    #[value(alias("PageInfo"))]
+    PageInfo,
+    #[value(alias("CacheEntryMetadata"))]
+    CacheEntryMetadata,
 }
 
 #[tokio::main]
@@ -102,9 +107,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doc { r#type } => {
             let schema = match r#type {
                 SchemaType::ExtractedAnchor => {
-                    schemars::schema_for!(
-                        web_browser_driver::ExtractedAnchor
-                    )
+                    schemars::schema_for!(web_browser_driver::ExtractedAnchor)
+                }
+                SchemaType::PageInfo => {
+                    schemars::schema_for!(web_browser_driver::PageInfo)
+                }
+                SchemaType::CacheEntryMetadata => {
+                    schemars::schema_for!(web_crawler_db::CacheEntryMetadata)
                 }
             };
             let schema = serde_json::to_string_pretty(&schema).unwrap();

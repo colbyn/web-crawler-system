@@ -14,7 +14,7 @@ use std::time::{
     Duration,
     Instant,
 };
-
+use schemars::JsonSchema;
 use serde::{
     Deserialize,
     Serialize,
@@ -23,7 +23,7 @@ use serde::{
 /// Low-level telemetry recorded while opening, waiting on, and inspecting a page.
 ///
 /// This type is intended to be persisted with the crawl result.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct PageTelemetry {
     /// Overall navigation/open telemetry.
@@ -256,7 +256,7 @@ impl PageTelemetryBuilder {
 }
 
 /// Navigation/open timing and outcome facts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct NavigationTelemetry {
     /// Wall-clock time spent in the open/navigate operation.
@@ -273,7 +273,7 @@ pub struct NavigationTelemetry {
 }
 
 /// Browser document readiness observations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct ReadinessTelemetry {
     /// Last observed `document.readyState`.
@@ -296,7 +296,7 @@ pub struct ReadinessTelemetry {
 }
 
 /// Browser document ready state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentReadyState {
     Loading,
@@ -320,7 +320,7 @@ impl DocumentReadyState {
 ///
 /// These fields are deliberately primitive. They can be filled by CDP Network
 /// events, browser Performance API measurements, or both.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct NetworkTelemetry {
     /// Number of requests observed.
@@ -350,7 +350,7 @@ pub struct NetworkTelemetry {
 }
 
 /// Browser/CDP/session health observations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct BrowserHealthTelemetry {
     /// Whether the CDP connection appeared alive at the end of the operation.
@@ -367,7 +367,7 @@ pub struct BrowserHealthTelemetry {
 }
 
 /// One low-level lifecycle/event observation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct PageTelemetryEvent {
     pub kind: PageTelemetryEventKind,
@@ -375,7 +375,7 @@ pub struct PageTelemetryEvent {
     pub elapsed_since_start: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PageTelemetryEventKind {
     NavigationStarted,
