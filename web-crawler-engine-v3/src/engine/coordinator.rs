@@ -30,6 +30,24 @@
 //! This keeps operational behavior robust: warm cache, live browser capture,
 //! tag association, extraction, sink recording, and failure handling remain the
 //! same across crawl depths.
+//!
+//! ## Online frontier scoring
+//!
+//! Frontier scoring is applied only when opened page results expose anchors.
+//! This means cache replay and live browser capture both feed the same scoring
+//! path because both produce normal `CrawlPageOutcome::Opened` evidence.
+//!
+//! Scoring remains a scheduling hint:
+//!
+//! - policy still decides whether a URL is in scope,
+//! - visit policy still decides whether a request may be opened,
+//! - cache identity remains based on requested URL,
+//! - workers remain unaware of scoring,
+//! - low-scored URLs are not filtered by scoring.
+//!
+//! The coordinator builds the optional scorer once for a crawl invocation and
+//! passes it into state expansion. The state/frontier layer owns the actual
+//! enqueue operation and priority ordering.
 
 use futures::{
     stream::FuturesUnordered,
@@ -42,7 +60,7 @@ use serde::{
 use web_crawler_db::CacheKey;
 
 use crate::{
-    // config::CrawlEngineConfig,
+    config::FrontierScoringConfig,
     error::CrawlEngineResult,
     input::CrawlRequest,
     output::{
@@ -55,6 +73,7 @@ use crate::{
     sessions::SessionPool,
     state::CrawlRunState,
     store::CrawlArtifactSink,
+    url_score::FrontierUrlScorer,
 };
 
 use super::CrawlEngine;
@@ -88,6 +107,9 @@ where
         let mut state = CrawlRunState::new(self.config.limits.clone(), seeds);
 
         let sessions = self.build_session_pool();
+
+        let frontier_scorer = build_frontier_scorer(&self.config.frontier.scoring);
+        let retain_score_evidence = self.config.frontier.scoring.retain_evidence;
 
         let mut inflight = FuturesUnordered::new();
         let max_concurrent_pages = self.config.concurrency.max_concurrent_pages.max(1);
@@ -188,7 +210,24 @@ where
             state.complete_reserved_page(result);
 
             if let Some(anchors) = opened_anchors {
-                state.expand_from_anchors(&request, &anchors, &self.policy);
+                let started = std::time::Instant::now();
+
+                state.expand_from_anchors(
+                    &request,
+                    &anchors,
+                    &self.policy,
+                    frontier_scorer.as_ref(),
+                    retain_score_evidence,
+                );
+
+                tracing::debug!(
+                    requested_url = %request.requested_url,
+                    expansion_ms = started.elapsed().as_millis(),
+                    frontier_len = state.frontier_len(),
+                    inflight = inflight.len(),
+                    max_concurrent_pages,
+                    "completed frontier expansion"
+                );
             }
         }
 
@@ -229,3 +268,14 @@ where
         })
     }
 }
+
+fn build_frontier_scorer(
+    config: &FrontierScoringConfig,
+) -> Option<FrontierUrlScorer> {
+    if !config.enabled {
+        return None;
+    }
+
+    Some(FrontierUrlScorer::builtin(config.builtin_profile))
+}
+

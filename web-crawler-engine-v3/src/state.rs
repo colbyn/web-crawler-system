@@ -30,9 +30,9 @@
 //! - opened page count per seed,
 //! - in-flight reserved page slots per seed.
 //!
-//! The in-flight lane matters once `engine.rs` dispatches concurrent page jobs.
-//! Without reservations, the coordinator could accidentally launch more work for
-//! a seed than its budget allows before completed results come back.
+//! The in-flight lane matters because the coordinator dispatches concurrent page
+//! jobs. Without reservations, the coordinator could accidentally launch more
+//! work for a seed than its budget allows before completed results come back.
 //!
 //! # Counting semantics
 //!
@@ -45,8 +45,9 @@
 //!
 //! # Run-local fetch dedupe
 //!
-//! The SQLite cache may dedupe artifacts by URL-level cache identity, but the
-//! crawl run must not erase caller associations before they reach the cache.
+//! The reusable artifact cache may dedupe artifacts by URL-level cache identity,
+//! but the crawl run must not erase caller associations before they reach the
+//! cache.
 //!
 //! Therefore queued/visited fetch keys are not merely normalized URLs. They also
 //! include seed context and inherited request tags. This allows two callers,
@@ -55,25 +56,43 @@
 //!
 //! Within one seed/tag context, normalized URL dedupe still prevents loops and
 //! repeated frontier spam.
+//!
+//! # Online frontier scoring
+//!
+//! Frontier scoring belongs here because this module is where extracted anchors
+//! become follow-up crawl requests.
+//!
+//! Scoring is deliberately a scheduling hint only:
+//!
+//! - scope policy still decides whether a discovered URL is internal enough,
+//! - visit policy still decides whether a queued request may be opened,
+//! - cache identity remains based on requested URL,
+//! - low score never means "exclude forever."
+//!
+//! As pages complete, their anchors are expanded. Each in-scope discovered URL
+//! can be scored before entering the frontier. The frontier remains seed-fair
+//! while using scores to prioritize work inside each seed bucket.
 
 use std::collections::{
     HashMap,
     HashSet,
 };
 
-use colored_json::Paint;
 use serde::{
     Deserialize,
     Serialize,
 };
 use url::Url;
 use web_browser_driver::ExtractedAnchor;
+use web_crawler_db::CacheTag;
 
 use crate::{
     config::CrawlLimits,
     frontier::{
         FrontierItem,
         FrontierQueue,
+        FrontierScore,
+        FrontierScoreEvidence,
     },
     input::{
         CrawlRequest,
@@ -92,9 +111,8 @@ use crate::{
         NormalizedUrl,
         UrlNormalizer,
     },
+    url_score::FrontierUrlScorer,
 };
-
-use web_crawler_db::CacheTag;
 
 /// Seed-local crawl budget identity.
 ///
@@ -339,20 +357,31 @@ where
         self.visited_fetch_keys.insert(fetch_key);
     }
 
-    /// Attempt to enqueue a request.
+    /// Attempt to enqueue a request with a neutral frontier score.
     ///
     /// Returns true when the request was actually added to the frontier.
     pub fn enqueue_request(&mut self, request: CrawlRequest<P>) -> bool {
+        self.enqueue_item(FrontierItem::new(request))
+    }
+
+    /// Attempt to enqueue a fully constructed frontier item.
+    ///
+    /// This is the lower-level insertion point used by scored frontier
+    /// expansion. It preserves all existing budget and dedupe semantics while
+    /// allowing the caller to attach priority and optional score evidence.
+    ///
+    /// Returns true when the item was actually added to the frontier.
+    pub fn enqueue_item(&mut self, item: FrontierItem<P>) -> bool {
         if self.global_page_budget_exhausted() {
             return false;
         }
 
         // Early budget backpressure. The final gate is still reservation time.
-        if !self.can_reserve_seed_slot(&request) {
+        if !self.can_reserve_seed_slot(&item.request) {
             return false;
         }
 
-        let fetch_key = FetchVisitKey::from_request(&request);
+        let fetch_key = FetchVisitKey::from_request(&item.request);
 
         if self.visited_fetch_keys.contains(&fetch_key) {
             return false;
@@ -362,7 +391,7 @@ where
             return false;
         }
 
-        if self.frontier.push(FrontierItem::new(request)) {
+        if self.frontier.push(item) {
             true
         } else {
             self.queued_fetch_keys.remove(&fetch_key);
@@ -402,12 +431,19 @@ where
     /// - respects scope policy,
     /// - avoids URLs already queued or visited in this run,
     /// - preserves seed/request context via `CrawlRequest::discovered_from`,
+    /// - optionally scores each discovered URL before enqueue,
     /// - avoids adding work for seeds whose page budget is already consumed.
+    ///
+    /// Scoring is online: each in-scope internal URL is scored as it is
+    /// uncovered. The frontier then decides scheduling order inside the seed
+    /// bucket. Low-scoring URLs are not filtered here.
     pub fn expand_from_anchors(
         &mut self,
         parent: &CrawlRequest<P>,
         anchors: &[ExtractedAnchor],
         policy: &CrawlPolicy,
+        scorer: Option<&FrontierUrlScorer>,
+        retain_score_evidence: bool,
     ) {
         let next_depth = parent.hop_depth + 1;
 
@@ -423,7 +459,13 @@ where
             return;
         }
 
+        let mut considered = 0usize;
+        let mut in_scope = 0usize;
+        let mut enqueued = 0usize;
+
         for anchor in anchors {
+            considered += 1;
+
             let Some(href) = &anchor.href else {
                 continue;
             };
@@ -435,19 +477,19 @@ where
                 continue;
             }
 
+            in_scope += 1;
+
             let new_request = CrawlRequest::discovered_from(parent, href.clone());
 
-            if self.enqueue_request(new_request) {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "➕ frontier depth={} {} <- {}",
-                        next_depth,
-                        href.as_str().magenta(),
-                        parent.requested_url.as_str().green(),
-                    )
-                    .cyan()
-                );
+            let item = build_frontier_item(
+                new_request,
+                href,
+                scorer,
+                retain_score_evidence,
+            );
+
+            if self.enqueue_item(item) {
+                enqueued += 1;
             }
 
             // Avoid flooding the frontier for a seed that no longer has
@@ -455,7 +497,128 @@ where
             if !self.can_reserve_seed_slot(parent) {
                 break;
             }
+
+            if self.global_page_budget_exhausted() {
+                break;
+            }
         }
+
+        tracing::debug!(
+            parent_url = %parent.requested_url,
+            next_depth,
+            considered,
+            in_scope,
+            enqueued,
+            frontier_len = self.frontier_len(),
+            "expanded anchors into frontier"
+        );
     }
 }
 
+fn build_frontier_item<P>(
+    request: CrawlRequest<P>,
+    href: &Url,
+    scorer: Option<&FrontierUrlScorer>,
+    retain_score_evidence: bool,
+) -> FrontierItem<P> {
+    let Some(scorer) = scorer else {
+        return FrontierItem::new(request);
+    };
+
+    let scored = scorer.score_url(href);
+    let score = FrontierScore::from_float(scored.score);
+
+    if retain_score_evidence {
+        let evidence = FrontierScoreEvidence {
+            score,
+            raw_score: scored.score,
+            profile: scored.profile,
+            labels: scored.labels.into_iter().collect(),
+            reasons: scored.reasons,
+        };
+
+        FrontierItem::new(request).with_score_evidence(evidence)
+    } else {
+        FrontierItem::new(request).with_score(score)
+    }
+}
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::url_score::{
+//         BuiltinUrlScoringProfile,
+//         FrontierUrlScorer,
+//     };
+
+//     fn request(url: &str) -> CrawlRequest {
+//         CrawlRequest::seed(Url::parse(url).unwrap())
+//     }
+
+//     fn anchor(href: &str) -> ExtractedAnchor {
+//         ExtractedAnchor {
+//             index: 0,
+//             raw_href: Some(href.to_string()),
+//             resolved_href: Some(Url::parse(href).unwrap()),
+//             text: None,
+//             label: None,
+//             attributes: Default::default(),
+//             position: None,
+//         }
+//     }
+
+//     #[test]
+//     fn scored_anchor_enters_frontier_before_lower_scored_anchor_for_same_seed() {
+//         let limits = CrawlLimits {
+//             max_pages_per_seed: 3,
+//             max_hop_depth: 1,
+//             max_frontier_items: 100,
+//             max_total_pages: None,
+//         };
+
+//         let seed = request("https://example.com/");
+//         let mut state = CrawlRunState::new(limits, vec![seed.clone()]);
+//         let _ = state.pop_next();
+
+//         let opened = CrawlPageResult {
+//             request: seed.clone(),
+//             cache_key: None,
+//             cache_decision: None,
+//             outcome: CrawlPageOutcome::Opened {
+//                 resolution: web_browser_driver::UrlResolution {
+//                     requested_url: Url::parse("https://example.com/").unwrap(),
+//                     final_url: Url::parse("https://example.com/").unwrap(),
+//                     redirects: Vec::new(),
+//                 },
+//                 status_code: Some(200),
+//                 telemetry: Default::default(),
+//                 non_critical_errors: Vec::new(),
+//                 page_info: None,
+//                 anchors: Vec::new(),
+//                 snapshot: crate::output::SnapshotDecision::NotRequested,
+//             },
+//         };
+
+//         state.record_page(opened);
+
+//         let scorer = FrontierUrlScorer::builtin(BuiltinUrlScoringProfile::Careers);
+
+//         state.expand_from_anchors(
+//             &seed,
+//             &[
+//                 anchor("https://example.com/privacy"),
+//                 anchor("https://example.com/careers"),
+//             ],
+//             &CrawlPolicy::default(),
+//             Some(&scorer),
+//             false,
+//         );
+
+//         let next = state.pop_next().unwrap();
+
+//         assert_eq!(
+//             next.request.requested_url.as_str(),
+//             "https://example.com/careers"
+//         );
+//     }
+// }

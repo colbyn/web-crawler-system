@@ -24,7 +24,7 @@
 //! - frontier scheduling,
 //! - URL scope policy,
 //! - cache lookup and snapshot artifact evaluation,
-//! - reusable crawl artifact persistence via `sqlite_cache`,
+//! - reusable crawl artifact persistence via `web-crawler-db`,
 //! - browser profile assignment,
 //! - page result assembly,
 //! - retry/recrawl decisions at the crawler layer.
@@ -51,7 +51,7 @@
 //!
 //! ## Cache identity versus caller association
 //!
-//! SQLite cache artifacts are reusable crawl artifacts. They are not ownership
+//! Postgres cache artifacts are reusable crawl artifacts. They are not ownership
 //! records.
 //!
 //! Cache identity should be based on stable request identity, such as requested
@@ -62,6 +62,21 @@
 //! categories, campaigns, or manual runs may all point at the same cached page.
 //! Cache writes and cache hits should merge request tags onto the artifact so
 //! warm-cache runs still preserve new associations.
+//!
+//! ## Frontier scoring
+//!
+//! Frontier scoring is an optional scheduling hint for newly discovered URLs.
+//!
+//! It is intentionally separate from crawl policy and cache identity:
+//!
+//! - policy decides whether a URL may be visited,
+//! - cache keys decide whether a reusable artifact exists,
+//! - scoring decides where a candidate URL sits in the frontier,
+//! - low score never means permanent exclusion.
+//!
+//! The scoring layer is pure CPU and operates on URL structure only. It is
+//! designed to run online as internal links are uncovered from cache replay or
+//! live browser extraction.
 //!
 //! ## Cache evolution
 //!
@@ -79,21 +94,17 @@ pub mod output;
 pub mod policy;
 pub mod scheduler;
 pub mod sessions;
-// pub mod sqlite_cache;
 pub mod state;
 pub mod store;
 pub mod url;
-
-// pub use cache::{
-//     CacheDecision, CacheKey, CachePolicy, CacheProducerInfo, CacheRejectionReason, CacheSnapshot,
-//     CachedExtractedFacts, CachedPageArtifact, CrawlCacheError, CrawlCacheStore, FsCrawlCacheStore,
-//     SnapshotCompression,
-// };
+pub mod url_score;
 
 pub use config::{
     CrawlConcurrency,
     CrawlEngineConfig,
     CrawlLimits,
+    FrontierConfig,
+    FrontierScoringConfig,
 };
 
 pub use engine::CrawlEngine;
@@ -104,10 +115,12 @@ pub use error::{
 };
 
 pub use frontier::{
+    FrontierDiscoverySeq,
     FrontierItem,
     FrontierItemId,
     FrontierQueue,
     FrontierScore,
+    FrontierScoreEvidence,
 };
 
 pub use input::{
@@ -130,6 +143,7 @@ pub use policy::{
     CachePolicy,
     CrawlPolicy,
     ScopeDecision,
+    ScopeMode,
     ScopePolicy,
     SnapshotPolicy,
     VisitDecision,
@@ -158,3 +172,23 @@ pub use url::{
     UrlIdentity,
     UrlNormalizer,
 };
+
+pub use url_score::{
+    compare_domainless_signatures,
+    compare_domainless_url_strs,
+    compare_domainless_urls,
+    domainless_signature,
+    is_likely_target_detail,
+    score_url_str_with_profile,
+    score_url_with_profile,
+    BuiltinUrlScoringProfile,
+    DomainlessUrlSignature,
+    FrontierUrlScorer,
+    PathSegmentShape,
+    ScoredUrl,
+    UrlScoreReason,
+    UrlScoringProfile,
+    UrlSimilarity,
+    CAREERS_PROFILE,
+};
+
