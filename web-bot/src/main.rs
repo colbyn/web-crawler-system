@@ -50,14 +50,21 @@ enum Commands {
         action: commands::db::DbCommands,
     },
     Doc {
-        #[arg(long)]
-        r#type: SchemaType,
+        #[command(subcommand)]
+        action: DocCommand,
     }
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum DocCommand {
+    Type {
+        kind: SchemaType
+    },
 }
 
 /// Shared sort direction for list-style commands.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchemaType {
+enum SchemaType {
     #[value(alias("ExtractedAnchor"))]
     ExtractedAnchor,
     #[value(alias("PageInfo"))]
@@ -104,20 +111,24 @@ async fn main() -> anyhow::Result<()> {
                 ))?;
             commands::db::run(action, db_url).await?
         }
-        Commands::Doc { r#type } => {
-            let schema = match r#type {
-                SchemaType::ExtractedAnchor => {
-                    schemars::schema_for!(web_browser_driver::ExtractedAnchor)
+        Commands::Doc { action } => {
+            match action {
+                DocCommand::Type { kind } => {
+                    let schema = match kind {
+                        SchemaType::ExtractedAnchor => {
+                            schemars::schema_for!(web_browser_driver::ExtractedAnchor)
+                        }
+                        SchemaType::PageInfo => {
+                            schemars::schema_for!(web_browser_driver::PageInfo)
+                        }
+                        SchemaType::CacheEntryMetadata => {
+                            schemars::schema_for!(web_crawler_db::CacheEntryMetadata)
+                        }
+                    };
+                    let schema = serde_json::to_string_pretty(&schema).unwrap();
+                    println!("{schema}");
                 }
-                SchemaType::PageInfo => {
-                    schemars::schema_for!(web_browser_driver::PageInfo)
-                }
-                SchemaType::CacheEntryMetadata => {
-                    schemars::schema_for!(web_crawler_db::CacheEntryMetadata)
-                }
-            };
-            let schema = serde_json::to_string_pretty(&schema).unwrap();
-            println!("{schema}");
+            }
         }
     }
 
